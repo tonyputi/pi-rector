@@ -1,0 +1,57 @@
+{
+	"name": "pi-rector",
+	"version": "0.0.0-development",
+	"description": "Subscription-aware router for Pi: virtual models that spend the cheap plans first, respecting plan billing windows and quota resets",
+	"license": "MIT",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"virtual-model",
+		"model-router",
+		"subscription",
+		"off-peak",
+		"quota-failover"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/tonyputi/pi-rector.git"
+	},
+	"pi": {
+		"extensions": [
+			"./auto-router.ts"
+		]
+	},
+	"files": [
+		"auto-router.ts",
+		"README.md",
+		"LICENSE"
+	],
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.4.0",
+		"@semantic-release/changelog": "^7.0.0",
+		"@semantic-release/git": "^11.0.1",
+		"@types/node": "^26.6.5",
+		"semantic-release": "^25.0.9",
+		"typescript": "^7.0.2"
+	},
+	"scripts": {
+		"test": "node test.ts"
+	},
+	"release": {
+		"branches": [
+			"main"
+		],
+		"plugins": [
+			"@semantic-release/commit-analyzer",
+			"@semantic-release/release-notes-generator",
+			"@semantic-release/changelog",
+			"@semantic-release/npm",
+			"@semantic-release/github",
+			"@semantic-release/git"
+		]
+	}
+}

@@ -49,8 +49,8 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Message } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, Model, ModelRoute, ModelRouteRequest } from "@earendil-works/pi-coding-agent";
+import type { Api, Message, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext, ModelRoute, ModelRouteRequest } from "@earendil-works/pi-coding-agent";
 
 const USAGE_FILE = join(fileURLToPath(new URL(".", import.meta.url)), "router-usage.json");
 const OPENAI_PROVIDERS = ["openai", "openai-codex"] as const;
@@ -58,7 +58,7 @@ type OpenAIProvider = (typeof OPENAI_PROVIDERS)[number];
 const OTHER: Record<OpenAIProvider, OpenAIProvider> = { openai: "openai-codex", "openai-codex": "openai" };
 /** Fallback probe when the error does not say when quota returns. */
 const RETRY_AFTER_UNKNOWN = 30 * 60_000;
-const LEVELS = ["low", "medium", "high", "xhigh"];
+const LEVELS = ["low", "medium", "high", "xhigh"] as const satisfies readonly ModelThinkingLevel[];
 
 interface RouterState {
 	/** Plus account this session uses for OpenAI models. */
@@ -71,7 +71,7 @@ interface Usage {
 	blocked: Record<string, number>;
 }
 
-interface TimeSpec {
+export interface TimeSpec {
 	/** Days like "mon", ranges like "mon-fri"; default: every day. */
 	days?: string[];
 	/** "HH:MM"; the window wraps over midnight when from > to. */
@@ -140,7 +140,7 @@ function configModelsAtLoad(): Record<string, ModelSpec> {
 	const user = readJson(join(agentDir, "settings.json"));
 	const project = readJson(join(process.cwd(), ".pi", "settings.json"));
 	const custom = { ...(user.autoRouter as AutoRouterSettings | undefined)?.models, ...(project.autoRouter as AutoRouterSettings | undefined)?.models };
-	return Object.fromEntries(Object.entries({ ...DEFAULTS.models, ...custom }).filter(([, v]) => v != null)) as Record<string, ModelSpec>;
+	return Object.fromEntries(Object.entries({ ...DEFAULTS.models, ...custom }).filter(([, v]) => v != null) as [string, ModelSpec][]);
 }
 
 function routerConfig(): { criteria: Record<string, Criterion>; workloads: Record<string, WorkloadEntry[]>; models: Record<string, ModelSpec> } {
@@ -148,7 +148,7 @@ function routerConfig(): { criteria: Record<string, Criterion>; workloads: Recor
 	return {
 		criteria: { ...DEFAULTS.criteria, ...custom?.criteria },
 		workloads: { ...DEFAULTS.workloads, ...custom?.workloads },
-		models: Object.fromEntries(Object.entries({ ...DEFAULTS.models, ...custom?.models }).filter(([, v]) => v != null)),
+		models: Object.fromEntries(Object.entries({ ...DEFAULTS.models, ...custom?.models }).filter(([, v]) => v != null) as [string, ModelSpec][]),
 	};
 }
 
@@ -156,7 +156,7 @@ function readUsage(): Usage {
 	try {
 		const raw = JSON.parse(readFileSync(USAGE_FILE, "utf8")) ?? {};
 		const counts = raw.counts ?? raw; // v1 wrote flat counts
-		const blocked = Object.fromEntries(Object.entries(raw.blocked ?? {}).filter(([, v]) => typeof v === "number"));
+		const blocked = Object.fromEntries(Object.entries(raw.blocked ?? {}).filter(([, v]) => typeof v === "number") as [string, number][]);
 		return {
 			counts: { openai: Number(counts.openai) || 0, "openai-codex": Number(counts["openai-codex"]) || 0 },
 			blocked,
@@ -342,7 +342,7 @@ function pickFromWorkload(
 	state: RouterState | undefined,
 	tier: string,
 	filter: (provider: string) => boolean,
-): { model: Model; level?: string } {
+): { model: Model<Api>; level?: string } {
 	const { criteria, workloads } = routerConfig();
 	const entries = (workloads[tier] ?? []).map((entry) => {
 		const model = typeof entry === "string" ? entry : entry.model;
@@ -386,15 +386,16 @@ function pickFromWorkload(
 }
 
 /** Record the dispatch (counts, block lift) and keep the Plus account in router state. */
-function dispatch(ctx: ExtensionContext, state: RouterState | undefined, model: Model, level: string): ModelRoute<RouterState> {
-	if (model.provider === "openai" || model.provider === "openai-codex") {
+function dispatch(ctx: ExtensionContext, state: RouterState | undefined, model: Model<Api>, level: string): ModelRoute<RouterState> {
+	const dispatchLevel = level as ModelThinkingLevel;
+	if (isPlus(model.provider)) {
 		const usage = readUsage();
 		usage.counts[model.provider]++; // per dispatched turn, so heavy sessions weigh more than quick ones
 		delete usage.blocked[model.provider]; // trying an account again clears its block
 		writeUsage(usage);
-		return { model, thinkingLevel: level, state: { openaiProvider: model.provider } };
+		return { model, thinkingLevel: dispatchLevel, state: { openaiProvider: model.provider } };
 	}
-	return { model, thinkingLevel: level, state: state };
+	return { model, thinkingLevel: dispatchLevel, state: state };
 }
 
 function isPlus(provider: string): provider is OpenAIProvider {
@@ -417,8 +418,7 @@ export default function (pi: ExtensionAPI) {
 	// providers are blocked - a failing route() reports the virtual "auto" provider, which is us.
 	pi.on("message_end", (event) => {
 		const message = event.message as { role?: string; provider?: string; stopReason?: string; errorMessage?: string };
-		const physical = message.provider === "openai" || message.provider === "openai-codex" || message.provider === "zai";
-		if (message.role === "assistant" && message.stopReason === "error" && physical) {
+		if (message.role === "assistant" && message.stopReason === "error" && (message.provider === "openai" || message.provider === "openai-codex" || message.provider === "zai")) {
 			block(message.provider, parseReset(message.errorMessage) ?? Date.now() + RETRY_AFTER_UNKNOWN);
 		}
 	});
@@ -509,7 +509,7 @@ export default function (pi: ExtensionAPI) {
 			if (request.reason === "retry" && request.failed && isPlus(request.failed.model.provider)) {
 				const failed = request.failed.model;
 				block(failed.provider, parseReset(request.failed.message.errorMessage) ?? Date.now() + RETRY_AFTER_UNKNOWN);
-				const other = OTHER[failed.provider];
+				const other = OTHER[failed.provider as OpenAIProvider];
 				if (blockedUntil(other) <= Date.now()) {
 					const model = ctx.modelRegistry.find(other, failed.id);
 					if (model) return dispatch(ctx, request.state, model, request.thinkingLevel);
