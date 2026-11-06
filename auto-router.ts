@@ -81,15 +81,15 @@ export interface TimeSpec {
 	tz?: string;
 }
 
-interface Criterion {
+export interface Criterion {
 	mode: "include" | "exclude";
 	time: TimeSpec;
 }
 
-type WorkloadEntry = string | { model: string; criteria?: string[]; level?: string };
+export type WorkloadEntry = string | { model: string; criteria?: string[]; level?: string };
 
 /** A config-defined pool model, registered as auto/<key>. */
-interface ModelSpec {
+export interface ModelSpec {
 	/** Display name in /model; default "Auto (<key>)". */
 	name?: string;
 	/** Workload whose candidates this model dispatches. */
@@ -100,7 +100,7 @@ interface ModelSpec {
 	criteria?: string[];
 }
 
-interface AutoRouterSettings {
+export interface AutoRouterSettings {
 	criteria?: Record<string, Criterion>;
 	workloads?: Record<string, WorkloadEntry[]>;
 	/** Pool models registered as auto/<key>; null removes a default. */
@@ -135,12 +135,45 @@ function readJson(path: string): Record<string, unknown> {
 
 /** Pool models at registration time. pi.getSettings() is an action method and cannot run during
  * extension loading, so the settings files are read directly, user first then project override. */
-function configModelsAtLoad(): Record<string, ModelSpec> {
+function configAtLoad(): { criteria: Record<string, Criterion>; workloads: Record<string, WorkloadEntry[]>; models: Record<string, ModelSpec> } {
 	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(fileURLToPath(new URL("..", import.meta.url)));
 	const user = readJson(join(agentDir, "settings.json"));
 	const project = readJson(join(process.cwd(), ".pi", "settings.json"));
-	const custom = { ...(user.autoRouter as AutoRouterSettings | undefined)?.models, ...(project.autoRouter as AutoRouterSettings | undefined)?.models };
-	return Object.fromEntries(Object.entries({ ...DEFAULTS.models, ...custom }).filter(([, v]) => v != null) as [string, ModelSpec][]);
+	const userRouter = (user.autoRouter as AutoRouterSettings | undefined) ?? {};
+	const projectRouter = (project.autoRouter as AutoRouterSettings | undefined) ?? {};
+	return {
+		criteria: { ...DEFAULTS.criteria, ...userRouter.criteria, ...projectRouter.criteria },
+		workloads: { ...DEFAULTS.workloads, ...userRouter.workloads, ...projectRouter.workloads },
+		models: Object.fromEntries(Object.entries({ ...DEFAULTS.models, ...userRouter.models, ...projectRouter.models }).filter(([, v]) => v != null) as [string, ModelSpec][]),
+	};
+}
+
+/** Fail fast on typos: a config the router cannot honor is reported at load, not in mid-chat. */
+export function validateConfig(criteria: Record<string, Criterion>, workloads: Record<string, WorkloadEntry[]>, models: Record<string, ModelSpec>): void {
+	for (const [name, def] of Object.entries(criteria)) {
+		if (!def?.time) throw new Error(`autoRouter criterion "${name}" is missing "time"`);
+		timeMatches(def.time, new Date()); // throws on bad days, times or timezone
+	}
+	for (const [tier, entries] of Object.entries(workloads)) {
+		entries.forEach((entry, index) => {
+			const label = `autoRouter workload "${tier}" [${index}]`;
+			const spec = typeof entry === "string" ? { model: entry } : entry;
+			const [provider, id] = spec.model.split("/");
+			if (!provider || !id) throw new Error(`Bad model "${spec.model}" in ${label}, expected "provider/id"`);
+			for (const name of spec.criteria ?? []) {
+				if (!criteria[name]) throw new Error(`Unknown criterion "${name}" in ${label}`);
+			}
+			if (spec.level !== undefined && !(LEVELS as readonly string[]).includes(spec.level)) {
+				throw new Error(`Bad level "${spec.level}" in ${label}, expected one of ${LEVELS.join(", ")}`);
+			}
+		});
+	}
+	for (const [id, spec] of Object.entries(models)) {
+		if (!workloads[spec.workload]) throw new Error(`autoRouter model "${id}" references unknown workload "${spec.workload}"`);
+		for (const name of spec.criteria ?? []) {
+			if (!criteria[name]) throw new Error(`Unknown criterion "${name}" on autoRouter model "${id}"`);
+		}
+	}
 }
 
 function routerConfig(): { criteria: Record<string, Criterion>; workloads: Record<string, WorkloadEntry[]>; models: Record<string, ModelSpec> } {
@@ -529,8 +562,10 @@ export default function (pi: ExtensionAPI) {
 
 	// Pool models from configuration: auto/<key> for each entry. Reserved ids keep
 	// the smart routers registered above; a null entry removes a default pool.
+	const atLoad = configAtLoad();
+	validateConfig(atLoad.criteria, atLoad.workloads, atLoad.models);
 	const reserved = new Set(["smart", "zai", "openai"]);
-	for (const [id, spec] of Object.entries(configModelsAtLoad())) {
+	for (const [id, spec] of Object.entries(atLoad.models)) {
 		if (reserved.has(id)) continue;
 		pi.registerVirtualModel<RouterState>({
 			provider: "auto",

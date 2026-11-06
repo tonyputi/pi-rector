@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { type TimeSpec, localParts, parseDays, parseReset, timeMatches } from "./auto-router.ts";
+import { type Criterion, type ModelSpec, validateConfig, type TimeSpec, type WorkloadEntry, localParts, parseDays, parseReset, timeMatches } from "./auto-router.ts";
 
 let passed = 0;
 function check(label: string, got: unknown, want: unknown): void {
@@ -50,5 +50,25 @@ check("compound duration", parseReset("resets in 2 hours and 30 minutes", NOW), 
 check("hyphenated 5-hour ignored", parseReset("You have hit your 5-hour usage limit", NOW), null);
 check("no message", parseReset(undefined, NOW), null);
 check("empty message", parseReset("", NOW), null);
+
+
+// validateConfig: typos are reported at load, valid configs pass
+const validCriteria: Record<string, Criterion> = { zaiPeak: { mode: "exclude", time: { days: ["mon-fri"], from: "14:00", to: "18:00", tz: "UTC+8" } } };
+const validWorkloads: Record<string, WorkloadEntry[]> = { complex: ["openai/gpt-6.1-sol"], standard: [{ model: "zai/glm-5.3", criteria: ["zaiPeak"] }] };
+const validModels: Record<string, ModelSpec> = { pool: { workload: "standard", providers: ["zai"] } };
+validateConfig(validCriteria, validWorkloads, validModels);
+passed++;
+assert.throws(() => validateConfig(validCriteria, { standard: [{ model: "zai/glm-5.3", criteria: ["nope"] }] }, validModels), /Unknown criterion "nope"/);
+passed++;
+assert.throws(() => validateConfig(validCriteria, { standard: ["senza-slash"] }, validModels), /Bad model "senza-slash"/);
+passed++;
+assert.throws(() => validateConfig(validCriteria, { standard: [{ model: "openai/x", level: "super" }] }, validModels), /Bad level "super"/);
+passed++;
+assert.throws(() => validateConfig(validCriteria, validWorkloads, { pool: { workload: "missing" } }), /unknown workload "missing"/);
+passed++;
+assert.throws(() => validateConfig({ broken: { mode: "exclude" } as unknown as Criterion }, validWorkloads, validModels), /missing "time"/);
+passed++;
+assert.throws(() => validateConfig({ bad: { mode: "exclude", time: { days: ["lun"] } } }, validWorkloads, validModels), /Unknown day "lun"/);
+passed++;
 
 console.log(`ok - ${passed} checks passed`);
