@@ -1,27 +1,30 @@
 # Contributing
 
-Thanks for taking a look! This is a small, security-focused Pi extension — the bar is intentionally high on correctness and low on ceremony.
+Thanks for taking a look! Keep changes focused and routing policies easy to understand.
 
 ## Development setup
 
 ```bash
-npm install   # installs the Pi peer dep (devDependency, tests only)
-npm test      # plain-assert self-checks, no framework, no network
+npm ci
+npx tsc --noEmit
+npm test
 ```
 
-No build step: the extension ships as a single `index.ts` (type-stripped by Node 22.18+). Keep it that way — one file is the auditability feature.
+No build step: the extension ships as `auto-router.ts` and Pi loads its TypeScript directly. Tests use Node's built-in test runner and assertions, mocked providers, and temporary settings fixtures. They must not call real providers or read real credentials.
 
 ## Pull requests
 
-- Small diffs. If a change needs a wall of prose to explain, split it.
-- Pure logic (`ssh config` parsing, `insteadOf` countersinks, env assembly) gets tests in `test.ts`.
-- `npm test` must pass; update the README if user-visible behavior changes.
-- Runtime dependencies stay at one: `@octokit/auth-app` (GitHub-maintained, owns JWTs + token cache). Everything else is Node built-ins and the Pi extension API — no new runtime deps without a security review.
-- Use [Conventional Commits](https://www.conventionalcommits.org/) in PR titles (the release workflow squash-merges them): `fix:` patches, `feat:` bumps minor, `feat!:`/`BREAKING CHANGE:` bumps major. `docs:`, `chore:`, `test:` and friends release nothing.
+- Use an issue for non-trivial work and keep one concern per PR.
+- Add tests in `test.ts` for classification, config validation, candidate resolution, or retry changes.
+- Automatic and manual group selection must share candidate eligibility and thinking rules.
+- Run type checking and tests; update README examples and migration guidance when configuration changes.
+- Do not add runtime dependencies for behavior already provided by Node or Pi.
+- Use [Conventional Commits](https://www.conventionalcommits.org/) in PR titles: `fix:` patches, `feat:` bumps minor, and breaking-change markers bump major. `docs:`, `chore:`, and `test:` do not trigger releases by themselves. Semantic-release uses the commits that land on the release branch.
+- Never commit credentials, private prompts, session histories, or local `router-usage.json` state.
 
 ## Security issues
 
-This extension handles a GitHub App private key. **Do not open a public issue for security problems** — use [private vulnerability reporting](https://github.com/tonyputi/pi-rector/security/advisories/new) instead.
+**Do not open a public issue for security problems.** Use [private vulnerability reporting](https://github.com/tonyputi/pi-rector/security/advisories/new).
 
 ## License
 

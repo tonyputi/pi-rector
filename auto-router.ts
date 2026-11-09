@@ -1,295 +1,283 @@
-/**
- * Auto router family - virtual models that spend the cheap plans first.
- *
- * Registers under the `auto` provider:
- *
- * - auto/smart: high effort -> the complex workload; low -> trivial; medium ->
- *   the free Jev classifier (opencode/jev-1.13-free) rates each user message.
- * - auto/zai: Z.ai candidates only.
- * - auto/openai: OpenAI candidates only, tier by effort/classifier.
- * - auto/openai-sol-6.1 / openai-terra-6.1 / openai-luna-6: one workload tier
- *   each, defined in settings like every other auto/<id> pool model.
- *
- * Workloads are configured in settings.json and walked in order; a candidate is
- * skipped when its provider is out of quota or its criteria say so. Named
- * criteria combine a mode (include/exclude) with a time window, so e.g. Z.ai
- * models stay out of the peak window when their points cost double. Two
- * consecutive entries with the same model on openai and openai-codex are a
- * balanced pair: the session sticks to one account (prompt cache) and accounts
- * are chosen by least dispatched turns overall. A failed request blocks its
- * provider until its quota returns - from the error message when it says so,
- * else probed after 30 minutes - and retries on the other account. A
- * successful response lifts the block.
- *
- * Settings (all optional; per-tier arrays replace the default, criteria merge).
- * An entry may set `level` to fix the thinking level that model is dispatched
- * at, regardless of the selected level:
- *
- *   "autoRouter": {
- *     "workloads": { "complex": [{ "model": "openai/gpt-6.1-sol", "level": "medium" }, "openai-codex/gpt-6.1-sol"] },
- *     "models": {
- *       "openai-sol-6.1":   { "name": "Auto (Sol 6.1)", "workload": "complex", "providers": ["openai", "openai-codex"] },
- *       "openai-terra-6.1": { "workload": "standard", "providers": ["openai", "openai-codex"] },
- *       "openai-luna-6":    { "workload": "trivial" },
- *       "night-glm":        { "workload": "standard", "providers": ["zai"], "criteria": ["nightOnly"] }
- *     },
- *     "criteria": {
- *       "zaiPeak": { "mode": "exclude", "time": { "days": ["mon-fri"], "from": "14:00", "to": "18:00", "tz": "UTC+8" } }
- *     },
- *     "workloads": {
- *       "complex":  ["openai/gpt-6.1-sol", "openai-codex/gpt-6.1-sol"],
- *       "standard": [{ "model": "zai/glm-5.3", "criteria": ["zaiPeak"] }, "openai/gpt-6-luna", "openai-codex/gpt-6-luna"],
- *       "trivial":  [{ "model": "zai/glm-5.3-flash", "criteria": ["zaiPeak"] }, "openai/gpt-6-luna", "openai-codex/gpt-6-luna"]
- *     }
- *   }
- *
- * Usage: pi --model auto/smart
- */
-
+/** Rector: configurable virtual model groups, selected manually or by a classifier. */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Api, Message, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, ModelRoute, ModelRouteRequest } from "@earendil-works/pi-coding-agent";
+import type { Api, AssistantMessage, Message, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext, type ModelRoute, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
 
 const USAGE_FILE = join(fileURLToPath(new URL(".", import.meta.url)), "router-usage.json");
-const OPENAI_PROVIDERS = ["openai", "openai-codex"] as const;
-type OpenAIProvider = (typeof OPENAI_PROVIDERS)[number];
-const OTHER: Record<OpenAIProvider, OpenAIProvider> = { openai: "openai-codex", "openai-codex": "openai" };
-/** Fallback probe when the error does not say when quota returns. */
-const RETRY_AFTER_UNKNOWN = 30 * 60_000;
 const LEVELS = ["low", "medium", "high", "xhigh"] as const satisfies readonly ModelThinkingLevel[];
-
-interface RouterState {
-	/** Plus account this session uses for OpenAI models. */
-	openaiProvider?: OpenAIProvider;
-}
-
-interface Usage {
-	counts: Record<OpenAIProvider, number>;
-	/** Provider -> epoch ms until which it is assumed out of quota. */
-	blocked: Record<string, number>;
-}
+const OPENAI = ["openai", "openai-codex"] as const;
+const RETRY_AFTER_UNKNOWN = 30 * 60_000;
 
 export interface TimeSpec {
-	/** Days like "mon", ranges like "mon-fri"; default: every day. */
 	days?: string[];
-	/** "HH:MM"; the window wraps over midnight when from > to. */
 	from?: string;
 	to?: string;
-	/** "local" (default), fixed "UTC+8", or IANA like "Europe/Rome". */
 	tz?: string;
 }
-
 export interface Criterion {
 	mode: "include" | "exclude";
 	time: TimeSpec;
 }
-
-export type WorkloadEntry = string | { model: string; criteria?: string[]; level?: string };
-
-/** A config-defined pool model, registered as auto/<key>. */
+export type Candidate = string | { model: string; criteria?: string[]; level?: ModelThinkingLevel };
 export interface ModelSpec {
-	/** Display name in /model; default "Auto (<key>)". */
 	name?: string;
-	/** Workload whose candidates this model dispatches. */
-	workload: string;
-	/** Restrict candidates to these providers; default: every provider. */
-	providers?: string[];
-	/** Criteria gating the whole model, on top of per-candidate criteria. */
 	criteria?: string[];
+	candidates: Candidate[];
 }
-
-export interface AutoRouterSettings {
-	criteria?: Record<string, Criterion>;
-	workloads?: Record<string, WorkloadEntry[]>;
-	/** Pool models registered as auto/<key>; null removes a default. */
-	models?: Record<string, ModelSpec | null>;
+export interface RectorConfig {
+	classifier: {
+		model: string;
+		instructions: string;
+		models: Record<string, string>;
+		fallback: string;
+	};
+	criteria: Record<string, Criterion>;
+	models: Record<string, ModelSpec>;
 }
+export interface RouterState {
+	group: string;
+	openaiProvider?: string;
+}
+export interface Usage {
+	counts: Record<string, number>;
+	blocked: Record<string, number>;
+}
+type Registry = Pick<ExtensionContext["modelRegistry"], "find" | "findOfType" | "classify" | "hasConfiguredAuth">;
 
-const DEFAULTS: Required<Omit<AutoRouterSettings, "models">> & { models: Record<string, ModelSpec> } = {
+const DEFAULTS: RectorConfig = {
+	classifier: {
+		model: "opencode/jev-1.13-free",
+		instructions: "Choose the model group best suited to the user's request in `prompt`.",
+		models: {
+			simple: "Short answers, simple lookups, and straightforward small edits.",
+			standard: "Ordinary implementation, bug fixes, reviews, and explanations.",
+			complex: "Architecture, difficult debugging, and cross-cutting changes.",
+		},
+		fallback: "standard",
+	},
 	criteria: {
 		zaiPeak: { mode: "exclude", time: { days: ["mon-fri"], from: "14:00", to: "18:00", tz: "UTC+8" } },
 	},
-	workloads: {
-		complex: ["openai/gpt-6.1-sol", "openai-codex/gpt-6.1-sol"],
-		standard: [{ model: "zai/glm-5.3", criteria: ["zaiPeak"] }, "openai/gpt-6.1-terra", "openai-codex/gpt-6.1-terra"],
-		trivial: [{ model: "zai/glm-5.3-flash", criteria: ["zaiPeak"] }, "openai/gpt-6-luna", "openai-codex/gpt-6-luna"],
-	},
 	models: {
-		"openai-sol-6.1": { name: "Auto (Sol 6.1)", workload: "complex", providers: ["openai", "openai-codex"] },
-		"openai-terra-6.1": { name: "Auto (Terra 6.1)", workload: "standard", providers: ["openai", "openai-codex"] },
-		"openai-luna-6": { name: "Auto (Luna 6)", workload: "trivial", providers: ["openai", "openai-codex"] },
+		simple: {
+			name: "Simple",
+			candidates: [
+				{ model: "zai/glm-5.3-flash", criteria: ["zaiPeak"] },
+				{ model: "openai/gpt-6-luna", level: "high" },
+				{ model: "openai-codex/gpt-6-luna", level: "high" },
+			],
+		},
+		standard: {
+			name: "Standard",
+			candidates: [{ model: "zai/glm-5.3", criteria: ["zaiPeak"] }, "openai/gpt-6.1-terra", "openai-codex/gpt-6.1-terra"],
+		},
+		complex: {
+			name: "Complex",
+			candidates: [{ model: "openai/gpt-6.1-sol", level: "medium" }, { model: "openai-codex/gpt-6.1-sol", level: "medium" }],
+		},
 	},
 };
 
-let settingsOf: () => Record<string, unknown> = () => ({});
-
-function readJson(path: string): Record<string, unknown> {
-	try {
-		return JSON.parse(readFileSync(path, "utf8")) ?? {};
-	} catch {
-		return {};
+function record(value: unknown, label: string): Record<string, unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
+	return value as Record<string, unknown>;
+}
+function text(value: unknown, label: string): asserts value is string {
+	if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must be a non-empty string`);
+}
+function knownKeys(value: Record<string, unknown>, keys: string[], label: string): void {
+	for (const key of Object.keys(value)) if (!keys.includes(key)) throw new Error(`Unknown ${label} setting "${key}"`);
+}
+function modelParts(value: unknown, label: string): [string, string] {
+	text(value, label);
+	const slash = value.indexOf("/");
+	if (slash < 1 || slash === value.length - 1 || /\s/.test(value)) throw new Error(`${label}: expected provider/model`);
+	return [value.slice(0, slash), value.slice(slash + 1)];
+}
+function references(value: unknown, criteria: Record<string, unknown>, label: string): void {
+	if (value === undefined) return;
+	if (!Array.isArray(value) || value.some((name) => typeof name !== "string" || !Object.hasOwn(criteria, name))) {
+		throw new Error(`${label}: expected an array of defined criterion names`);
 	}
 }
 
-/** Pool models at registration time. pi.getSettings() is an action method and cannot run during
- * extension loading, so the settings files are read directly, user first then project override. */
-function configAtLoad(): { criteria: Record<string, Criterion>; workloads: Record<string, WorkloadEntry[]>; models: Record<string, ModelSpec> } {
-	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(fileURLToPath(new URL("..", import.meta.url)));
-	const user = readJson(join(agentDir, "settings.json"));
-	const project = readJson(join(process.cwd(), ".pi", "settings.json"));
-	const userRouter = (user.autoRouter as AutoRouterSettings | undefined) ?? {};
-	const projectRouter = (project.autoRouter as AutoRouterSettings | undefined) ?? {};
-	return {
-		criteria: { ...DEFAULTS.criteria, ...userRouter.criteria, ...projectRouter.criteria },
-		workloads: { ...DEFAULTS.workloads, ...userRouter.workloads, ...projectRouter.workloads },
-		models: Object.fromEntries(Object.entries({ ...DEFAULTS.models, ...userRouter.models, ...projectRouter.models }).filter(([, v]) => v != null) as [string, ModelSpec][]),
-	};
-}
-
-/** Fail fast on typos: a config the router cannot honor is reported at load, not in mid-chat. */
-export function validateConfig(criteria: Record<string, Criterion>, workloads: Record<string, WorkloadEntry[]>, models: Record<string, ModelSpec>): void {
-	for (const [name, def] of Object.entries(criteria)) {
-		if (!def?.time) throw new Error(`autoRouter criterion "${name}" is missing "time"`);
-		timeMatches(def.time, new Date()); // throws on bad days, times or timezone
+export function validateConfig(value: unknown): asserts value is RectorConfig {
+	const config = record(value, "rector");
+	knownKeys(config, ["classifier", "criteria", "models"], "rector");
+	const criteria = record(config.criteria, "rector.criteria");
+	for (const [name, value] of Object.entries(criteria)) {
+		const criterion = record(value, `rector.criteria.${name}`);
+		knownKeys(criterion, ["mode", "time"], `rector.criteria.${name}`);
+		if (criterion.mode !== "include" && criterion.mode !== "exclude") throw new Error(`rector.criteria.${name}: invalid mode`);
+		const time = record(criterion.time, `rector.criteria.${name}.time`);
+		knownKeys(time, ["days", "from", "to", "tz"], `rector.criteria.${name}.time`);
+		if (time.days !== undefined) {
+			if (!Array.isArray(time.days) || time.days.some((day) => typeof day !== "string")) throw new Error(`rector.criteria.${name}: invalid days`);
+			parseDays(time.days);
+		}
+		for (const bound of ["from", "to"]) if (time[bound] !== undefined) {
+			text(time[bound], `rector.criteria.${name}.${bound}`);
+			parseHHMM(time[bound]);
+		}
+		if (time.tz !== undefined) text(time.tz, `rector.criteria.${name}.tz`);
+		localParts(time.tz as string | undefined, new Date());
 	}
-	for (const [tier, entries] of Object.entries(workloads)) {
-		entries.forEach((entry, index) => {
-			const label = `autoRouter workload "${tier}" [${index}]`;
-			const spec = typeof entry === "string" ? { model: entry } : entry;
-			const [provider, id] = spec.model.split("/");
-			if (!provider || !id) throw new Error(`Bad model "${spec.model}" in ${label}, expected "provider/id"`);
-			for (const name of spec.criteria ?? []) {
-				if (!criteria[name]) throw new Error(`Unknown criterion "${name}" in ${label}`);
-			}
-			if (spec.level !== undefined && !(LEVELS as readonly string[]).includes(spec.level)) {
-				throw new Error(`Bad level "${spec.level}" in ${label}, expected one of ${LEVELS.join(", ")}`);
-			}
-		});
-	}
-	for (const [id, spec] of Object.entries(models)) {
-		if (!workloads[spec.workload]) throw new Error(`autoRouter model "${id}" references unknown workload "${spec.workload}"`);
-		for (const name of spec.criteria ?? []) {
-			if (!criteria[name]) throw new Error(`Unknown criterion "${name}" on autoRouter model "${id}"`);
+	const models = record(config.models, "rector.models");
+	for (const [id, value] of Object.entries(models)) {
+		if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(id) || id === "auto") throw new Error(`rector.models: invalid or reserved id "${id}"`);
+		const spec = record(value, `rector.models.${id}`);
+		knownKeys(spec, ["name", "criteria", "candidates"], `rector.models.${id}`);
+		if (spec.name !== undefined) text(spec.name, `rector.models.${id}.name`);
+		references(spec.criteria, criteria, `rector.models.${id}.criteria`);
+		if (!Array.isArray(spec.candidates) || !spec.candidates.length) throw new Error(`rector.models.${id}: candidates must be a non-empty array`);
+		for (const [index, value] of spec.candidates.entries()) {
+			const label = `rector.models.${id}.candidates[${index}]`;
+			const entry = typeof value === "string" ? { model: value } : record(value, label);
+			knownKeys(entry, ["model", "criteria", "level"], label);
+			const [provider] = modelParts(entry.model, label);
+			if (provider === "rector" || provider === "auto") throw new Error(`${label}: candidates must be physical models, not Rector routes`);
+			references(entry.criteria, criteria, `${label}.criteria`);
+			if (entry.level !== undefined && !(LEVELS as readonly unknown[]).includes(entry.level)) throw new Error(`${label}: invalid level`);
 		}
 	}
+	const classifier = record(config.classifier, "rector.classifier");
+	knownKeys(classifier, ["model", "instructions", "models", "fallback"], "rector.classifier");
+	modelParts(classifier.model, "rector.classifier.model");
+	text(classifier.instructions, "rector.classifier.instructions");
+	const choices = record(classifier.models, "rector.classifier.models");
+	if (!Object.keys(choices).length) throw new Error("rector.classifier.models must not be empty");
+	for (const [id, rule] of Object.entries(choices)) {
+		if (!Object.hasOwn(models, id)) throw new Error(`rector.classifier.models: unknown model group "${id}"`);
+		text(rule, `rector.classifier.models.${id}`);
+	}
+	text(classifier.fallback, "rector.classifier.fallback");
+	if (!Object.hasOwn(choices, classifier.fallback)) throw new Error("rector.classifier.fallback must name a classifier model group");
 }
 
-function routerConfig(): { criteria: Record<string, Criterion>; workloads: Record<string, WorkloadEntry[]>; models: Record<string, ModelSpec> } {
-	const custom = (settingsOf() as unknown as { autoRouter?: AutoRouterSettings }).autoRouter;
+/** Convert legacy settings in memory only; no user files or stored selections are rewritten. */
+function legacyConfig(user: Record<string, unknown>, project: Record<string, unknown>): RectorConfig {
+	const a = user.autoRouter === undefined ? {} : record(user.autoRouter, "autoRouter");
+	const b = project.autoRouter === undefined ? {} : record(project.autoRouter, "autoRouter");
+	const section = (source: Record<string, unknown>, key: string) => source[key] === undefined ? {} : record(source[key], `autoRouter.${key}`);
+	const tiers = { trivial: DEFAULTS.models.simple.candidates, standard: DEFAULTS.models.standard.candidates, complex: DEFAULTS.models.complex.candidates, ...section(a, "workloads"), ...section(b, "workloads") };
+	const groups: Record<string, ModelSpec> = {};
+	for (const [id, candidates] of Object.entries(tiers)) groups[id] = { candidates: candidates as Candidate[] };
+	const pools = { ...section(a, "models"), ...section(b, "models") };
+	for (const [id, value] of Object.entries(pools)) {
+		if (value === null) continue;
+		if (["smart", "zai", "openai"].includes(id) || Object.hasOwn(tiers, id)) throw new Error(`autoRouter.models.${id} conflicts with a router or workload; migrate to rector.models`);
+		const pool = record(value, `autoRouter.models.${id}`);
+		text(pool.workload, `autoRouter.models.${id}.workload`);
+		if (!Object.hasOwn(tiers, pool.workload)) throw new Error(`autoRouter.models.${id}: unknown workload "${pool.workload}"`);
+		let candidates = tiers[pool.workload as keyof typeof tiers];
+		if (!Array.isArray(candidates)) throw new Error(`autoRouter workload "${pool.workload}" must be an array`);
+		if (pool.providers !== undefined) {
+			if (!Array.isArray(pool.providers) || pool.providers.some((provider) => typeof provider !== "string")) throw new Error(`autoRouter.models.${id}: invalid providers`);
+			candidates = candidates.filter((entry) => (pool.providers as string[]).includes(modelParts(typeof entry === "string" ? entry : record(entry, id).model, id)[0]));
+		}
+		groups[id] = { name: pool.name as string | undefined, criteria: pool.criteria as string[] | undefined, candidates: candidates as Candidate[] };
+	}
 	return {
-		criteria: { ...DEFAULTS.criteria, ...custom?.criteria },
-		workloads: { ...DEFAULTS.workloads, ...custom?.workloads },
-		models: Object.fromEntries(Object.entries({ ...DEFAULTS.models, ...custom?.models }).filter(([, v]) => v != null) as [string, ModelSpec][]),
+		classifier: { ...DEFAULTS.classifier, models: { trivial: DEFAULTS.classifier.models.simple, standard: DEFAULTS.classifier.models.standard, complex: DEFAULTS.classifier.models.complex } },
+		criteria: { ...DEFAULTS.criteria, ...section(a, "criteria"), ...section(b, "criteria") } as Record<string, Criterion>,
+		models: groups,
 	};
 }
 
-function readUsage(): Usage {
-	try {
-		const raw = JSON.parse(readFileSync(USAGE_FILE, "utf8")) ?? {};
-		const counts = raw.counts ?? raw; // v1 wrote flat counts
-		const blocked = Object.fromEntries(Object.entries(raw.blocked ?? {}).filter(([, v]) => typeof v === "number") as [string, number][]);
-		return {
-			counts: { openai: Number(counts.openai) || 0, "openai-codex": Number(counts["openai-codex"]) || 0 },
-			blocked,
-		};
-	} catch {
-		// First run or unreadable file: start from zero.
-		return { counts: { openai: 0, "openai-codex": 0 }, blocked: {} };
+export function resolveConfig(user: Record<string, unknown> = {}, project: Record<string, unknown> = {}): { config: RectorConfig; legacy: boolean } {
+	const hasRector = user.rector !== undefined || project.rector !== undefined;
+	const legacy = user.autoRouter !== undefined || project.autoRouter !== undefined;
+	let config: RectorConfig;
+	if (legacy && !hasRector) config = legacyConfig(user, project);
+	else {
+		let merged: Record<string, unknown> = structuredClone(DEFAULTS) as unknown as Record<string, unknown>;
+		for (const settings of [user, project]) {
+			if (settings.rector === undefined) continue;
+			const custom = record(settings.rector, "rector");
+			knownKeys(custom, ["classifier", "criteria", "models"], "rector");
+			for (const key of ["classifier", "criteria", "models"]) if (custom[key] !== undefined) {
+				merged[key] = { ...record(merged[key], key), ...record(custom[key], `rector.${key}`) };
+			}
+		}
+		merged.models = Object.fromEntries(Object.entries(record(merged.models, "rector.models")).filter(([, value]) => value !== null));
+		config = merged as unknown as RectorConfig;
 	}
+	validateConfig(config);
+	return { config, legacy };
 }
 
+function readSettings(path: string): Record<string, unknown> {
+	try {
+		return record(JSON.parse(readFileSync(path, "utf8")), path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+		throw new Error(`Cannot read Rector settings from ${path}`, { cause: error });
+	}
+}
+function readUsage(): Usage {
+	try {
+		const raw = JSON.parse(readFileSync(USAGE_FILE, "utf8"));
+		const numbers = (value: unknown) => Object.fromEntries(Object.entries(record(value, "usage")).filter(([, n]) => typeof n === "number" && Number.isFinite(n) && n >= 0)) as Record<string, number>;
+		return { counts: numbers(raw.counts ?? raw), blocked: numbers(raw.blocked ?? {}) };
+	} catch {
+		return { counts: {}, blocked: {} };
+	}
+}
 function writeUsage(usage: Usage): void {
 	try {
 		writeFileSync(USAGE_FILE, JSON.stringify(usage));
 	} catch {
-		// shortcut: if the usage file is unwritable, balancing degrades to tie-breaking and resets on restart
+		// shortcut: an unwritable installation loses routing history; use a writable checkout for persistence.
 	}
 }
 
-function blockedUntil(provider: string, usage = readUsage()): number {
-	return usage.blocked[provider] ?? 0;
-}
-
-function block(provider: string, untilMs: number): void {
-	const usage = readUsage();
-	usage.blocked[provider] = Math.max(untilMs, usage.blocked[provider] ?? 0);
-	writeUsage(usage);
-}
-
-function unblock(provider: string): void {
-	const usage = readUsage();
-	if (usage.blocked[provider] === undefined) return;
-	delete usage.blocked[provider];
-	writeUsage(usage);
-}
-
 const DAY_INDEX: Record<string, number> = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
-
 export function parseDays(days: readonly string[]): Set<number> {
 	const out = new Set<number>();
 	for (const day of days) {
 		const range = /^([a-z]{3})-([a-z]{3})$/.exec(day);
 		if (range) {
-			const from = DAY_INDEX[range[1]];
-			const to = DAY_INDEX[range[2]];
+			const from = DAY_INDEX[range[1]], to = DAY_INDEX[range[2]];
 			if (from === undefined || to === undefined) throw new Error(`Unknown day range "${day}"`);
-			for (let i = from; ; i = (i + 1) % 7) {
-				out.add(i);
-				if (i === to) break;
-			}
+			for (let i = from; ; i = (i + 1) % 7) { out.add(i); if (i === to) break; }
 		} else {
-			const index = DAY_INDEX[day];
-			if (index === undefined) throw new Error(`Unknown day "${day}"`);
-			out.add(index);
+			if (!Object.hasOwn(DAY_INDEX, day)) throw new Error(`Unknown day "${day}"`);
+			out.add(DAY_INDEX[day]);
 		}
 	}
 	return out;
 }
-
 function parseHHMM(value: string): number {
 	const match = /^(\d{1,2}):(\d{2})$/.exec(value);
-	if (!match) throw new Error(`Bad time "${value}", expected HH:MM`);
-	const minutes = Number(match[1]) * 60 + Number(match[2]);
-	if (minutes > 24 * 60) throw new Error(`Bad time "${value}"`);
-	return minutes;
+	if (!match || Number(match[2]) > 59 || Number(match[1]) > 24 || (Number(match[1]) === 24 && Number(match[2]) !== 0)) throw new Error(`Bad time "${value}", expected HH:MM`);
+	return Number(match[1]) * 60 + Number(match[2]);
 }
-
-/** Weekday (0 = Sunday) and minute of day at `tz`: "local", a fixed "UTC+8", or an IANA zone. */
 export function localParts(tz: string | undefined, now: Date): { day: number; minutes: number } {
 	if (!tz || tz === "local") return { day: now.getDay(), minutes: now.getHours() * 60 + now.getMinutes() };
-	const offset = /^(?:UTC|GMT)([+-]\d{1,2})(?::?(\d{2}))?$/.exec(tz);
+	const offset = /^(?:UTC|GMT)([+-])(\d{1,2})(?::?(\d{2}))?$/.exec(tz);
 	if (offset) {
-		const shifted = new Date(now.getTime() + (Number(offset[1]) * 60 + Number(offset[2] ?? 0)) * 60_000);
+		if (Number(offset[2]) > 23 || Number(offset[3] ?? 0) > 59) throw new Error(`Bad timezone "${tz}"`);
+		const minutes = (Number(offset[2]) * 60 + Number(offset[3] ?? 0)) * (offset[1] === "-" ? -1 : 1);
+		const shifted = new Date(now.getTime() + minutes * 60_000);
 		return { day: shifted.getUTCDay(), minutes: shifted.getUTCHours() * 60 + shifted.getUTCMinutes() };
 	}
 	const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short", hour: "numeric", minute: "numeric", hourCycle: "h23" }).formatToParts(now);
 	const get = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
 	return { day: DAY_INDEX[get("weekday").toLowerCase()] ?? -1, minutes: Number(get("hour")) * 60 + Number(get("minute")) };
 }
-
 export function timeMatches(spec: TimeSpec, now: Date): boolean {
 	const parts = localParts(spec.tz, now);
 	if (spec.days && !parseDays(spec.days).has(parts.day)) return false;
-	if (spec.from || spec.to) {
-		const from = spec.from ? parseHHMM(spec.from) : 0;
-		const to = spec.to ? parseHHMM(spec.to) : 24 * 60;
-		const inWindow = from <= to ? parts.minutes >= from && parts.minutes < to : parts.minutes >= from || parts.minutes < to;
-		if (!inWindow) return false;
-	}
-	return true;
+	const from = spec.from ? parseHHMM(spec.from) : 0, to = spec.to ? parseHHMM(spec.to) : 24 * 60;
+	return from <= to ? parts.minutes >= from && parts.minutes < to : parts.minutes >= from || parts.minutes < to;
 }
-
-/** An entry passes when every include criterion matches and no exclude criterion does. */
-function entryAllowed(entry: { model: string; criteria?: string[] }, criteria: Record<string, Criterion>, now: Date): boolean {
-	for (const name of entry.criteria ?? []) {
+function allowed(names: string[] | undefined, criteria: Record<string, Criterion>, now: Date): boolean {
+	return (names ?? []).every((name) => {
 		const def = criteria[name];
-		if (!def?.time) throw new Error(`Unknown or incomplete criterion "${name}" in autoRouter settings`);
-		const hit = timeMatches(def.time, now);
-		if (def.mode === "exclude" ? hit : !hit) return false;
-	}
-	return true;
+		return def.mode === "include" ? timeMatches(def.time, now) : !timeMatches(def.time, now);
+	});
 }
 
 const UNITS: Record<string, number> = {
@@ -298,12 +286,6 @@ const UNITS: Record<string, number> = {
 	h: 3_600_000, hr: 3_600_000, hrs: 3_600_000, hour: 3_600_000, hours: 3_600_000,
 	d: 86_400_000, day: 86_400_000, days: 86_400_000,
 };
-
-/**
- * When the provider says when quota returns, believe it: an explicit timestamp wins (clamped to
- * [now+1min, now+7d]), else the sum of durations like "2 hours and 30 minutes" (capped at 5h).
- * Hyphenated forms ("5-hour limit") are deliberately ignored. Null when the message says nothing.
- */
 export function parseReset(message: string | undefined, now = Date.now()): number | null {
 	if (!message) return null;
 	const stamp = message.match(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/);
@@ -314,276 +296,123 @@ export function parseReset(message: string | undefined, now = Date.now()): numbe
 		if (!Number.isNaN(t)) return Math.min(Math.max(t, now + 60_000), now + 7 * 86_400_000);
 	}
 	let delay = 0;
-	for (const match of message.matchAll(/(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|s|m|h|d)\b/g)) {
-		delay += Number(match[1]) * (UNITS[match[2]] ?? 0);
-	}
+	for (const match of message.matchAll(/(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|s|m|h|d)\b/g)) delay += Number(match[1]) * (UNITS[match[2]] ?? 0);
 	return delay > 0 ? now + Math.min(delay, 5 * 3_600_000) : null;
 }
-
+function block(usage: Usage, provider: string, message: string | undefined, now: number): void {
+	usage.blocked[provider] = Math.max(usage.blocked[provider] ?? 0, parseReset(message, now) ?? now + RETRY_AFTER_UNKNOWN);
+}
+export function recordResponse(usage: Usage, message: Pick<AssistantMessage, "provider" | "stopReason" | "errorMessage">, now = Date.now()): void {
+	if (message.stopReason === "error") block(usage, message.provider, message.errorMessage, now);
+	else if (message.stopReason !== "aborted") delete usage.blocked[message.provider];
+}
 function lastUserText(messages: readonly Message[]): string {
 	const content = messages.filter((message) => message.role === "user").at(-1)?.content ?? "";
-	if (typeof content === "string") return content;
-	return content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
+	return typeof content === "string" ? content : content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n");
 }
-
-type Difficulty = "trivial" | "standard" | "complex";
-
-/** Jev rates the last user message; a missing or failed rating counts as standard. */
-async function rateDifficulty(request: ModelRouteRequest<RouterState>, ctx: ExtensionContext): Promise<Difficulty> {
-	const jev = ctx.modelRegistry.findOfType("classifier", "opencode", "jev-1.13-free");
-	if (!jev) return "standard";
+async function classify(config: RectorConfig, request: ModelRouteRequest<RouterState>, registry: Registry, now: Date): Promise<string> {
+	const { classifier, models, criteria } = config;
+	const choices = Object.fromEntries(Object.entries(classifier.models).filter(([id]) => allowed(models[id].criteria, criteria, now)));
+	if (!Object.keys(choices).length) throw new Error("Rector: no model group is eligible under its criteria");
+	const fallback = () => {
+		if (!Object.hasOwn(choices, classifier.fallback)) throw new Error(`Rector: fallback group "${classifier.fallback}" is excluded by criteria`);
+		return classifier.fallback;
+	};
+	const [provider, id] = modelParts(classifier.model, "rector.classifier.model");
+	const model = registry.findOfType("classifier", provider, id);
+	if (!model) return fallback();
 	try {
-		const result = await ctx.modelRegistry.classify(
-			jev,
-			{
-				state: { prompt: lastUserText(request.messages).slice(0, 16_000) },
-				questions: {
-					difficulty: {
-						type: "choice",
-						instructions: "How demanding is the work requested in `prompt`?",
-						criteria: {
-							trivial: "One-liner replies, quick questions, small lookups - no real engineering",
-							standard: "Ordinary features, fixes, reviews, or explanations",
-							complex: "Subtle design, cross-cutting changes, or hard debugging",
-						},
-					},
-				},
-			},
-			{ signal: request.signal },
-		);
-		const answer = result.stopReason === "stop" ? result.answers.difficulty : undefined;
-		return answer?.type === "choice" && answer.choice !== undefined ? (answer.choice as Difficulty) : "standard";
-	} catch {
-		// shortcut: a broken or expired classifier routes as standard instead of failing the turn
-		return "standard";
+		const result = await registry.classify(model, {
+			state: { prompt: lastUserText(request.messages).slice(0, 16_000) },
+			questions: { model: { type: "choice", instructions: classifier.instructions, criteria: choices } },
+		}, { signal: request.signal });
+		request.signal?.throwIfAborted();
+		if (result.stopReason === "aborted") throw new DOMException("Rector classification aborted", "AbortError");
+		const answer = result.stopReason === "stop" ? result.answers.model : undefined;
+		if (answer?.type === "choice" && Object.hasOwn(choices, answer.choice)) return answer.choice;
+	} catch (error) {
+		request.signal?.throwIfAborted();
+		if (error instanceof Error && error.name === "AbortError") throw error;
+		// shortcut: unavailable classifiers use the configured fallback; no chat-model adapter.
 	}
+	return fallback();
 }
 
-/** Tool follow-ups stay on the model that handled the turn. */
-function stickyRoute(request: ModelRouteRequest<RouterState>): ModelRoute<RouterState> | undefined {
-	if (request.reason === "user" || !request.previous) return undefined;
-	return { model: request.previous.model, thinkingLevel: request.previous.thinkingLevel ?? "medium", state: request.state };
-}
-
-/**
- * Walk a workload in order and return a model whose provider has quota and whose criteria pass.
- * A consecutive same-model pair on openai/openai-codex is balanced by least dispatched turns,
- * sticky to the account the session already uses. `filter` scopes candidates to a provider set.
- */
-function pickFromWorkload(
-	ctx: ExtensionContext,
-	state: RouterState | undefined,
-	tier: string,
-	filter: (provider: string) => boolean,
-): { model: Model<Api>; level?: string } {
-	const { criteria, workloads } = routerConfig();
-	const entries = (workloads[tier] ?? []).map((entry) => {
-		const model = typeof entry === "string" ? entry : entry.model;
-		const [provider, id] = model.split("/");
-		if (!provider || !id) throw new Error(`Bad model "${model}" in autoRouter workload "${tier}", expected "provider/id"`);
-		return { provider, id, criteria: typeof entry === "string" ? undefined : entry.criteria, level: typeof entry === "string" ? undefined : entry.level };
-	});
-	const usage = readUsage();
-	const now = new Date();
-	const skip: string[] = [];
-
-	for (let i = 0; i < entries.length; i++) {
-		const entry = entries[i];
-		if (!filter(entry.provider)) continue;
-		const model = ctx.modelRegistry.find(entry.provider, entry.id);
-		const usable = (provider: string, id: string, entryCriteria?: string[]) =>
-			ctx.modelRegistry.find(provider, id) && blockedUntil(provider, usage) <= now.getTime() && entryAllowed({ model: id, criteria: entryCriteria }, criteria, now);
-		const isPlus = entry.provider === "openai" || entry.provider === "openai-codex";
-		const next = entries[i + 1];
-
-		// A balanced pair across the two Plus accounts resolves in one step.
-		if (isPlus && next && (next.provider === "openai" || next.provider === "openai-codex") && next.provider !== entry.provider && next.id === entry.id) {
-			i++;
-			const pool: OpenAIProvider[] = [];
-			if (usable(entry.provider, entry.id, entry.criteria) && model) pool.push(entry.provider as OpenAIProvider);
-			if (usable(next.provider, next.id, next.criteria)) pool.push(next.provider as OpenAIProvider);
-			if (!pool.length) {
-				skip.push(`${entry.id}: both Plus accounts unavailable`);
-				continue;
-			}
-			const chosen = state?.openaiProvider && pool.includes(state.openaiProvider)
-				? state.openaiProvider
-				: pool.reduce((best, p) => (usage.counts[p] < usage.counts[best] ? p : best));
-			return { model: ctx.modelRegistry.find(chosen, entry.id)!, level: chosen === entry.provider ? entry.level : next.level };
+/** One resolver for automatic selection, manual groups, continuations, and retries. */
+export async function routeRequest(config: RectorConfig, groupId: string | undefined, request: ModelRouteRequest<RouterState>, registry: Registry, usage: Usage, now = new Date()): Promise<ModelRoute<RouterState>> {
+	request.signal?.throwIfAborted();
+	if (request.reason === "retry" && request.failed) block(usage, request.failed.model.provider, request.failed.message.errorMessage, now.getTime());
+	const group = groupId ?? (request.reason === "user" ? await classify(config, request, registry, now) : request.state?.group ?? config.classifier.fallback);
+	const spec = config.models[group];
+	if (!spec) throw new Error(`Rector: unknown model group "${group}"; reload Pi after changing configuration`);
+	if (!allowed(spec.criteria, config.criteria, now)) throw new Error(`rector/${group} is excluded by its criteria`);
+	const skipped: string[] = [];
+	const candidates = spec.candidates.map((entry) => typeof entry === "string" ? { model: entry } : entry);
+	const usable = (entry: (typeof candidates)[number]): Model<Api> | undefined => {
+		const [provider, id] = modelParts(entry.model, "candidate");
+		const model = registry.find(provider, id);
+		let reason: string | undefined;
+		if (!model) reason = "not in catalog";
+		else if (model.api === "pi-virtual") reason = "not a physical model";
+		else if (!registry.hasConfiguredAuth(model)) reason = "no credentials";
+		else if ((usage.blocked[provider] ?? 0) > now.getTime()) reason = `blocked until ${new Date(usage.blocked[provider]).toISOString()}`;
+		else if (!allowed(entry.criteria, config.criteria, now)) reason = "criteria";
+		if (reason) { skipped.push(`${entry.model}: ${reason}`); return undefined; }
+		return model;
+	};
+	const dispatch = (entry: (typeof candidates)[number], model: Model<Api>): ModelRoute<RouterState> => {
+		const state: RouterState = { group, openaiProvider: request.state?.openaiProvider };
+		if ((OPENAI as readonly string[]).includes(model.provider)) {
+			state.openaiProvider = model.provider;
+			usage.counts[model.provider] = (usage.counts[model.provider] ?? 0) + 1;
 		}
-
-		if (model && usable(entry.provider, entry.id, entry.criteria)) return { model, level: entry.level };
-		skip.push(`${entry.provider}/${entry.id}: ${!model ? "not in catalog" : blockedUntil(entry.provider, usage) > now.getTime() ? "quota blocked" : "criteria"}`);
+		return { model, thinkingLevel: entry.level ?? request.thinkingLevel, state };
+	};
+	if (request.reason === "continuation" && request.previous && request.state?.group === group) {
+		const entry = candidates.find((entry) => entry.model === `${request.previous!.model.provider}/${request.previous!.model.id}` && usable(entry));
+		if (entry) return { model: request.previous.model, thinkingLevel: entry.level ?? request.previous.thinkingLevel ?? request.thinkingLevel, state: request.state };
 	}
-	throw new Error(`autoRouter workload "${tier}": no candidate available${skip.length ? ` (${skip.join("; ")})` : ""}`);
-}
-
-/** Record the dispatch (counts, block lift) and keep the Plus account in router state. */
-function dispatch(ctx: ExtensionContext, state: RouterState | undefined, model: Model<Api>, level: string): ModelRoute<RouterState> {
-	const dispatchLevel = level as ModelThinkingLevel;
-	if (isPlus(model.provider)) {
-		const usage = readUsage();
-		usage.counts[model.provider]++; // per dispatched turn, so heavy sessions weigh more than quick ones
-		delete usage.blocked[model.provider]; // trying an account again clears its block
-		writeUsage(usage);
-		return { model, thinkingLevel: dispatchLevel, state: { openaiProvider: model.provider } };
+	for (let i = 0; i < candidates.length; i++) {
+		const entry = candidates[i], next = candidates[i + 1];
+		const [provider, id] = modelParts(entry.model, "candidate");
+		const nextParts = next ? modelParts(next.model, "candidate") : undefined;
+		if ((OPENAI as readonly string[]).includes(provider) && nextParts && (OPENAI as readonly string[]).includes(nextParts[0]) && nextParts[0] !== provider && nextParts[1] === id) {
+			i++;
+			const pool = [entry, next].flatMap((candidate) => { const model = usable(candidate); return model ? [{ entry: candidate, model }] : []; });
+			if (!pool.length) continue;
+			const chosen = pool.find(({ model }) => model.provider === request.state?.openaiProvider) ?? pool.reduce((best, item) => (usage.counts[item.model.provider] ?? 0) < (usage.counts[best.model.provider] ?? 0) ? item : best);
+			return dispatch(chosen.entry, chosen.model);
+		}
+		const model = usable(entry);
+		if (model) return dispatch(entry, model);
 	}
-	return { model, thinkingLevel: dispatchLevel, state: state };
-}
-
-function isPlus(provider: string): provider is OpenAIProvider {
-	return provider === "openai" || provider === "openai-codex";
-}
-
-/** Tier for this request: manual levels win, medium asks the classifier. */
-async function tierFor(request: ModelRouteRequest<RouterState>, ctx: ExtensionContext): Promise<string> {
-	if (request.thinkingLevel === "high" || request.thinkingLevel === "xhigh") return "complex";
-	if (request.thinkingLevel === "low") return "trivial";
-	if (request.reason === "user") return await rateDifficulty(request, ctx);
-	return "standard";
+	throw new Error(`rector/${group}: no candidate available (${skipped.join("; ")})`);
 }
 
 export default function (pi: ExtensionAPI) {
-	settingsOf = () => pi.getSettings() as unknown as Record<string, unknown>;
-
-	// Observe every failed response: a quota error that Pi does not retry would otherwise never
-	// block the provider, and the next turn would hit the dead account again. Only physical
-	// providers are blocked - a failing route() reports the virtual "auto" provider, which is us.
-	pi.on("message_end", (event) => {
-		const message = event.message as { role?: string; provider?: string; stopReason?: string; errorMessage?: string };
-		if (message.role === "assistant" && message.stopReason === "error" && (message.provider === "openai" || message.provider === "openai-codex" || message.provider === "zai")) {
-			block(message.provider, parseReset(message.errorMessage) ?? Date.now() + RETRY_AFTER_UNKNOWN);
-		}
+	const user = readSettings(join(getAgentDir(), "settings.json"));
+	const project = readSettings(join(process.cwd(), ".pi", "settings.json"));
+	const { config, legacy } = resolveConfig(user, project);
+	const usesProject = project.rector !== undefined || (user.rector === undefined && project.autoRouter !== undefined);
+	if (legacy) pi.on("session_start", (_event, ctx) => {
+		ctx.ui.notify("autoRouter is deprecated. Migrate to rector and select rector/auto (Rector) or rector/<group>. If rector is present, autoRouter is ignored. Thinking no longer selects a group.", "warning");
 	});
-
-	pi.registerVirtualModel<RouterState>({
-		provider: "auto",
-		id: "smart",
-		name: "Auto",
-		thinkingLevels: LEVELS,
-		async route(request, ctx) {
-			// A response that got through proves the quota is back.
-			if (request.previous) unblock(request.previous.model.provider);
-
-			// A failed request blocks its provider until its quota returns and retries elsewhere.
-			if (request.reason === "retry" && request.failed) {
-				const failed = request.failed.model;
-				if (failed.provider === "zai") {
-					block("zai", parseReset(request.failed.message.errorMessage) ?? Date.now() + RETRY_AFTER_UNKNOWN);
-					const pick = pickFromWorkload(ctx, request.state, await tierFor(request, ctx), (p) => p !== "zai");
-					return dispatch(ctx, request.state, pick.model, pick.level ?? request.thinkingLevel);
-				}
-				if (isPlus(failed.provider)) {
-					block(failed.provider, parseReset(request.failed.message.errorMessage) ?? Date.now() + RETRY_AFTER_UNKNOWN);
-					const other = OTHER[failed.provider];
-					if (blockedUntil(other) <= Date.now()) {
-						const model = ctx.modelRegistry.find(other, failed.id);
-						if (model) return dispatch(ctx, request.state, model, request.thinkingLevel);
-					}
-					// Both Plus accounts out: any remaining candidate (criteria still apply) buys the turn.
-					const pick = pickFromWorkload(ctx, request.state, await tierFor(request, ctx), (p) => !isPlus(p));
-					return dispatch(ctx, request.state, pick.model, pick.level ?? request.thinkingLevel);
-				}
-			}
-
-			const sticky = stickyRoute(request);
-			if (sticky) return sticky;
-
-			const tier = await tierFor(request, ctx);
-			const pick = pickFromWorkload(ctx, request.state, tier, () => true);
-			return dispatch(ctx, request.state, pick.model, pick.level ?? (tier === "trivial" ? "low" : request.thinkingLevel));
-		},
-	});
-
-	pi.registerVirtualModel<RouterState>({
-		provider: "auto",
-		id: "zai",
-		name: "Auto (Z.ai)",
-		thinkingLevels: LEVELS,
-		async route(request, ctx) {
-			// A response that got through proves the quota is back.
-			if (request.previous?.model.provider === "zai") unblock("zai");
-
-			if (request.reason === "retry" && request.failed?.model.provider === "zai") {
-				block("zai", parseReset(request.failed.message.errorMessage) ?? Date.now() + RETRY_AFTER_UNKNOWN);
-				throw new Error(`Z.ai is out of quota; it returns at ${new Date(blockedUntil("zai")).toLocaleTimeString()}. Select an OpenAI model instead.`);
-			}
-			if (blockedUntil("zai") > Date.now()) {
-				throw new Error(`Z.ai is out of quota; it returns at ${new Date(blockedUntil("zai")).toLocaleTimeString()}. Select an OpenAI model instead.`);
-			}
-
-			const sticky = stickyRoute(request);
-			if (sticky) return sticky;
-
-			// Every workload may carry Z.ai candidates; the richer tier wins.
-			const tier = await tierFor(request, ctx);
-			const order = [tier, "standard", "trivial", "complex"].filter((t, i, a) => a.indexOf(t) === i);
-			for (const candidate of order) {
-				try {
-					const pick = pickFromWorkload(ctx, request.state, candidate, (p) => p === "zai");
-					return dispatch(ctx, request.state, pick.model, pick.level ?? (tier === "trivial" ? "low" : request.thinkingLevel));
-				} catch {
-					// This workload has no usable Z.ai candidate; try the next.
-				}
-			}
-			throw new Error("No Z.ai candidate is available under the autoRouter criteria; use auto/smart or an OpenAI model.");
-		},
-	});
-
-	pi.registerVirtualModel<RouterState>({
-		provider: "auto",
-		id: "openai",
-		name: "Auto (OpenAI)",
-		thinkingLevels: LEVELS,
-		async route(request, ctx) {
-			// A response that got through proves the quota is back.
-			if (request.previous) unblock(request.previous.model.provider);
-
-			if (request.reason === "retry" && request.failed && isPlus(request.failed.model.provider)) {
-				const failed = request.failed.model;
-				block(failed.provider, parseReset(request.failed.message.errorMessage) ?? Date.now() + RETRY_AFTER_UNKNOWN);
-				const other = OTHER[failed.provider as OpenAIProvider];
-				if (blockedUntil(other) <= Date.now()) {
-					const model = ctx.modelRegistry.find(other, failed.id);
-					if (model) return dispatch(ctx, request.state, model, request.thinkingLevel);
-				}
-				const back = new Date(Math.min(blockedUntil("openai"), blockedUntil("openai-codex"))).toLocaleTimeString();
-				throw new Error(`Both OpenAI accounts are out of quota; the earlier one returns at ${back}.`);
-			}
-
-			const sticky = stickyRoute(request);
-			if (sticky) return sticky;
-
-			const tier = await tierFor(request, ctx);
-			const pick = pickFromWorkload(ctx, request.state, tier, isPlus);
-			return dispatch(ctx, request.state, pick.model, pick.level ?? request.thinkingLevel);
-		},
-	});
-
-	// Pool models from configuration: auto/<key> for each entry. Reserved ids keep
-	// the smart routers registered above; a null entry removes a default pool.
-	const atLoad = configAtLoad();
-	validateConfig(atLoad.criteria, atLoad.workloads, atLoad.models);
-	const reserved = new Set(["smart", "zai", "openai"]);
-	for (const [id, spec] of Object.entries(atLoad.models)) {
-		if (reserved.has(id)) continue;
+	for (const [id, name] of [["auto", "Rector"], ...Object.entries(config.models).map(([id, spec]) => [id, spec.name ?? id])]) {
 		pi.registerVirtualModel<RouterState>({
-			provider: "auto",
-			id,
-			name: spec.name ?? `Auto (${id})`,
-			thinkingLevels: LEVELS,
-			route(request, ctx) {
-				if (request.previous) unblock(request.previous.model.provider);
-				if (spec.criteria?.length && !entryAllowed({ model: id, criteria: spec.criteria }, routerConfig().criteria, new Date())) {
-					throw new Error(`auto/${id} is not available under its criteria; select another model.`);
-				}
-				const sticky = stickyRoute(request);
-				if (sticky) return sticky;
-				const providers = spec.providers;
-				const filter = providers ? (p: string) => providers.includes(p) : () => true;
-				const pick = pickFromWorkload(ctx, request.state, spec.workload, filter);
-				return dispatch(ctx, request.state, pick.model, pick.level ?? request.thinkingLevel);
+			provider: "rector", id, name, thinkingLevels: LEVELS,
+			async route(request, ctx) {
+				if (usesProject && !ctx.isProjectTrusted()) throw new Error("Rector project configuration requires project trust. Trust the project and reload Pi, or remove its Rector settings.");
+				const usage = readUsage();
+				try { return await routeRequest(config, id === "auto" ? undefined : id, request, ctx.modelRegistry, usage); }
+				finally { writeUsage(usage); }
 			},
 		});
 	}
+	pi.on("message_end", (event, ctx) => {
+		const message = event.message;
+		if (ctx.model?.provider !== "rector" || message.role !== "assistant" || message.provider === "rector") return;
+		const usage = readUsage();
+		recordResponse(usage, message);
+		writeUsage(usage);
+	});
 }
