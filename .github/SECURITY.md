@@ -20,7 +20,7 @@ This extension routes requests through Pi's model registry and reuses Pi's provi
 - exposing provider credentials, private prompts, or sensitive configuration in logs or persisted routing state
 - configuration or retry behavior that bypasses declared candidate eligibility
 
-The configured classifier receives text from the last user message. Only select classifier providers you trust with that content. Review third-party extension code before installing it.
+Configured classifier criteria receive text from the last user message. Only select classifier providers you trust with that content. Manual group selection intentionally bypasses group-level classifier gates, but not time gates or candidate conditions. These policies are not a sandbox. Review third-party extension code before installing it.
 
 Out of scope, consistent with [Pi's own security model](https://github.com/earendil-works/pi/blob/main/SECURITY.md):
 
