@@ -8,17 +8,19 @@ This project is in early development: security fixes land on `main` and are rele
 
 **Do not open a public issue.** Use [private vulnerability reporting](https://github.com/tonyputi/pi-rector/security/advisories/new) — reports reach only the maintainer, and GitHub supports discussing, fixing, and publishing a coordinated advisory.
 
-Include what you can: reproduction steps, affected behavior, and the extension and Pi versions. The `router-usage.json` state file and the `autoRouter` settings section are safe to share — they contain no secrets.
+Include reproduction steps, affected behavior, and the extension and Pi versions. Sanitize `rector` configuration and `router-usage.json` before sharing: they do not require credentials, but custom instructions, model names, and usage metadata may be private. Never include Pi's `auth.json`, API keys, private prompts, or session histories.
 
 Expect an acknowledgment within a few days. Disclosure is coordinated through a GitHub Security Advisory once a fix is released, with credit in the advisory unless you prefer to remain anonymous.
 
 ## Scope
 
-This extension handles a GitHub App private key and deliberately keeps agent credentials isolated from personal ones. In scope:
+This extension routes requests through Pi's model registry and reuses Pi's provider authentication. It does not manage GitHub credentials or provide a sandbox. In scope:
 
-- leaking the private key, the credential file, or installation tokens to other processes, logs, or disk
-- bypasses of the isolation guards (credential-helper reset, SSH guard, `insteadOf` countersinks, environment stripping)
-- anything that lets agent commands silently use *personal* credentials, or personal shells pick up *agent* credentials
+- sending prompt text to a provider outside the configured classification and routing policy
+- exposing provider credentials, private prompts, or sensitive configuration in logs or persisted routing state
+- configuration or retry behavior that bypasses declared candidate eligibility
+
+The configured classifier receives text from the last user message. Only select classifier providers you trust with that content. Review third-party extension code before installing it.
 
 Out of scope, consistent with [Pi's own security model](https://github.com/earendil-works/pi/blob/main/SECURITY.md):
 
