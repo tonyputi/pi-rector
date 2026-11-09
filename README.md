@@ -1,62 +1,40 @@
 # pi-rector
 
-**Your subscriptions. One model selector.**
+**Your models. Your conditions. One selector.**
 
-A [Pi](https://pi.dev) extension that adds **Rector**, an automatic model selector, and your own virtual model groups alongside Pi's normal models. Configure how requests are classified, which models each group tries, and when each candidate is eligible.
+A [Pi](https://pi.dev) extension that adds **Rector**, an automatic model selector, plus virtual model groups you can select directly. Define when a group fits a request, when its candidates are eligible, and which fallback to try next — in configuration, not TypeScript.
 
 [![CI](https://github.com/tonyputi/pi-rector/actions/workflows/ci.yml/badge.svg)](https://github.com/tonyputi/pi-rector/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/tonyputi/pi-rector/blob/main/LICENSE)
 
 *From Latin rector: a guide or helmsman, from regere, to steer.*
 
-[Quick start](#quick-start) · [Configuration](#configuration) · [Routing](#how-routing-works) · [Migration](#migrating-from-autorouter) · [Troubleshooting](#troubleshooting)
+[Quick start](#quick-start) · [Configuration](#configuration) · [Manual selection](#automatic-versus-manual-selection) · [Routing](#how-routing-works) · [Migration](#migration) · [Troubleshooting](#troubleshooting)
 
-## The problem
+## Why Rector?
 
-The best model for a quick question may not be the one you want for architecture work. Subscription billing windows and account limits complicate the choice further — and manually switching models interrupts the work.
+A short lookup and a difficult debugging task do not need the same model. Subscription billing windows and unavailable accounts complicate the choice further.
 
-Rector lets you express that policy once:
+Rector composes two kinds of condition:
 
-- **Classification rules you control**, using a compatible Pi classifier.
-- **Ordered candidate groups**, with thinking overrides and fallback inside each group.
-- **Time criteria**, including billing windows, fixed UTC offsets, and daylight-saving-aware zones.
-- **OpenAI account balancing**, with session affinity and persisted dispatch counts.
-- **Manual selection when you want it**, without disabling automatic routing for other tasks.
+- **Classifier criteria:** ask a compatible Pi classifier a yes/no question about the request.
+- **Time criteria:** include or exclude a calendar window, with fixed offsets or daylight-saving-aware timezones.
 
-You decide what “cheap first” means through candidate order. Rector does not fetch prices, measure remaining subscription quota, or guarantee the cheapest model.
+Attach conditions to a **group**, to its **physical candidates**, or both. Every attached condition combines with **AND**. Groups and candidates are tried in order; adjacent matching OpenAI accounts can be balanced.
 
-## One group, two ways to use it
-
-```text
-Select Rector  → classifier chooses a group → resolve its physical candidates
-Select a group → skip classification       → resolve its physical candidates
-Select a normal Pi model                  → use Pi normally
-```
-
-A **virtual model group** is simply a named list of physical candidates. There is no separate workload layer or duplicate pool definition.
-
-| Selection in `/model` | Model ID | Behavior |
-| --- | --- | --- |
-| **Rector** | `rector/auto` | Automatically choose a group using your classifier rules |
-| **Simple** | `rector/simple` | Use the `simple` group's candidates directly |
-| **Standard** | `rector/standard` | Use the `standard` group's candidates directly |
-| **Complex** | `rector/complex` | Use the `complex` group's candidates directly |
-| Your custom group | `rector/<key>` | Use the candidates under `rector.models.<key>` |
-| A normal Pi model | Its existing ID | Bypass Rector entirely |
-
-`simple`, `standard`, and `complex` are defaults, not special categories. You can use your own names. `auto` is reserved for Rector itself.
+This is a configurable routing policy, not a subscription-metering service. Rector does not fetch prices, read remaining subscription quota, or guarantee the cheapest model.
 
 ## Quick start
 
 ### 1. Install
 
-Install from Git:
+From Git:
 
 ```bash
 pi install git:github.com/tonyputi/pi-rector
 ```
 
-Or use a local checkout:
+Or a local checkout:
 
 ```bash
 pi install /absolute/path/to/pi-rector
@@ -68,61 +46,61 @@ The npm package is not yet published. Once available, installation will also be:
 pi install npm:pi-rector
 ```
 
-No additional runtime dependencies: the extension uses Node built-ins and Pi's APIs. Use a Pi version with virtual-model routing and classifier support; development checks target Pi 1.4.0.
+No additional runtime dependencies: Rector uses Node built-ins and Pi's APIs. Development checks target Pi 1.4.0, including its virtual-model and classifier APIs.
 
 ### 2. Connect your providers
 
-Authenticate the physical models and classifier through Pi as usual. Rector reuses Pi's model registry and credentials; it does not create accounts or manage sign-in.
+Authenticate physical models and classifiers through Pi as usual. Rector reuses Pi's registry and credentials; it does not manage accounts or sign-in.
 
-The bundled groups use the model IDs in the complete configuration below. **Check your Pi catalog and replace IDs you cannot access.** Two-account balancing requires `openai` and `openai-codex` to actually represent the distinct accounts you intend to use.
+**Check that your catalog includes the model IDs below**, or replace them with models you can access. OpenAI balancing only represents two separate accounts if `openai` and `openai-codex` are authenticated as the distinct identities you intend to use.
 
-### 3. Choose Rector
+### 3. Choose automatic or direct selection
 
-Start or reload Pi, then select **Rector** in `/model`:
+Start or reload Pi and select **Rector** in `/model`:
 
 ```bash
 pi --model rector/auto
 ```
 
-Or select a group directly:
+To choose a group yourself:
 
 ```bash
 pi --model rector/complex
 ```
 
-**Thinking effort no longer selects the group.** Rector uses classification at every offered thinking level. Candidate `level` overrides control physical effort; without one, your selected effort passes through. Pi clamps effort to what the physical model supports.
+Normal Pi models remain selectable and bypass Rector entirely.
 
 ## Configuration
 
-Three sections describe the whole policy:
+Only two sections describe the policy:
 
 | Section | Responsibility |
 | --- | --- |
-| `classifier` | Which compatible classifier to call, which groups it can choose, and the rules for choosing them |
-| `criteria` | Named time conditions reusable by groups and individual candidates |
-| `models` | Selectable virtual model groups and their ordered physical candidates |
+| `criteria` | Named time conditions and compatible classifier questions |
+| `models` | Ordered virtual groups, their conditions, and physical candidates |
 
-Put `rector` in `~/.pi/agent/settings.json` or project `.pi/settings.json`. `PI_CODING_AGENT_DIR` overrides the user directory. Merge the section into your existing settings; do not overwrite unrelated settings. **Run `/reload` after edits** — registration and validation use a settings snapshot at extension load. If the policy uses project settings, Rector refuses to route until Pi reports the project as trusted.
+Put `rector` in `~/.pi/agent/settings.json` or project `.pi/settings.json`. `PI_CODING_AGENT_DIR` overrides the user directory. Merge it into existing settings rather than overwriting unrelated settings. **Run `/reload` after edits**: validation and registration use a load-time snapshot. Policies using project settings require Pi's project trust before routing.
 
 ### Complete configuration
 
-This is the bundled policy, shown explicitly so you can customize it:
+This is the bundled policy. Notice the order: Simple, Complex, then an unconditional Standard fallback.
 
 ```json
 {
   "rector": {
-    "classifier": {
-      "model": "opencode/jev-1.13-free",
-      "instructions": "Choose the model group best suited to the user's request in `prompt`.",
-      "models": {
-        "simple": "Short answers, simple lookups, and straightforward small edits.",
-        "standard": "Ordinary implementation, bug fixes, reviews, and explanations.",
-        "complex": "Architecture, difficult debugging, and cross-cutting changes."
-      },
-      "fallback": "standard"
-    },
     "criteria": {
+      "simpleTask": {
+        "type": "classifier",
+        "model": "opencode/jev-1.13-free",
+        "instructions": "Is the request in `prompt` a short answer, simple lookup, or straightforward small edit?"
+      },
+      "complexTask": {
+        "type": "classifier",
+        "model": "opencode/jev-1.13-free",
+        "instructions": "Does the request in `prompt` require architecture, difficult debugging, or cross-cutting changes rather than ordinary implementation?"
+      },
       "zaiPeak": {
+        "type": "time",
         "mode": "exclude",
         "time": {
           "days": ["mon-fri"],
@@ -135,10 +113,19 @@ This is the bundled policy, shown explicitly so you can customize it:
     "models": {
       "simple": {
         "name": "Simple",
+        "criteria": ["simpleTask"],
         "candidates": [
           { "model": "zai/glm-5.3-flash", "criteria": ["zaiPeak"] },
           { "model": "openai/gpt-6-luna", "level": "high" },
           { "model": "openai-codex/gpt-6-luna", "level": "high" }
+        ]
+      },
+      "complex": {
+        "name": "Complex",
+        "criteria": ["complexTask"],
+        "candidates": [
+          { "model": "openai/gpt-6.1-sol", "level": "medium" },
+          { "model": "openai-codex/gpt-6.1-sol", "level": "medium" }
         ]
       },
       "standard": {
@@ -148,57 +135,53 @@ This is the bundled policy, shown explicitly so you can customize it:
           "openai/gpt-6.1-terra",
           "openai-codex/gpt-6.1-terra"
         ]
-      },
-      "complex": {
-        "name": "Complex",
-        "candidates": [
-          { "model": "openai/gpt-6.1-sol", "level": "medium" },
-          { "model": "openai-codex/gpt-6.1-sol", "level": "medium" }
-        ]
       }
     }
   }
 }
 ```
 
-For example, Rector can classify an ordinary bug fix as `standard`. Outside the excluded window it first considers GLM; if unavailable, it considers the Terra account pair. Selecting **Standard** manually runs that exact same candidate resolver, without calling the classifier.
+For a simple request, Rector first checks `simpleTask`. If it passes, Rector looks inside Simple: GLM-Flash outside the excluded window, otherwise an eligible Luna account. If Simple cannot serve the request, Rector considers Complex and then Standard.
 
-### Classifier: your selection rules
+**Fallback is explicit policy.** Standard has no group conditions, so it is a fallback even when a matching Complex group has no available candidate. Remove that fallback or add restrictive conditions if you do not want automatic cross-group downgrades. Selecting Complex directly never falls through to Standard.
 
-- `model` is a `provider/model` ID resolved specifically as a **classifier**, not a chat model. See [Pi's classifier documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/models.md#use-classifier-models) for compatible providers and authentication.
-- `instructions` is the overall question passed to the classifier.
-- `models` maps group IDs to semantic descriptions. These descriptions are the selection rules; they are not deterministic predicates.
-- `fallback` names a listed group to use when the classifier is missing, fails, or returns an invalid answer. Cancellation does not trigger fallback.
+### Classifier conditions
 
-Every classifier choice must refer to an existing group. Groups omitted from `classifier.models` remain manually selectable. Group-level criteria remove excluded groups from the classifier's choices; an excluded fallback produces a clear error instead of choosing an arbitrary alternative.
+A classifier criterion names a compatible `provider/model` and an `instructions` question. It uses Pi's typed **boolean** classifier API, not generated chat text. A valid probability of at least `0.5` satisfies the condition; false, missing, malformed, or unsuccessful answers do not. Cancellation stops routing rather than falling through.
 
-The classifier receives up to 16,000 characters of text from the last user message. It does not receive the entire conversation or images. **That text is sent to your configured classifier provider**, which can add cost and latency before the physical model responds.
+Multiple questions may all be true. **Configuration order breaks ties**, not classifier confidence or a hidden ranking algorithm. Descriptions are semantic rules, not deterministic guarantees.
 
-### Criteria: group gates versus candidate gates
+Rector sends up to 16,000 characters of text from the last user message to the configured classifier provider. It does not send conversation history or images. Questions using the same classifier model are batched when needed; unused criterion definitions are not sent. Different classifier models can require separate calls, adding latency and usage charges.
 
-The bundled `zaiPeak` policy excludes weekdays 14:00–18:00 at UTC+8. It is editable policy, not a guarantee about your plan's current billing terms.
+Answers are reused within the user turn, including continuations and retries. A new user turn or changed criterion definitions invalidates them. Branch-local routing state stores boolean results and a configuration hash, not the prompt. Define a final unconditioned group if classifier failure should have a fallback; there is no separate global classifier or hidden fallback setting.
 
-- On a **candidate**, a criterion can skip that candidate and leave later candidates available.
-- On a **group**, a criterion makes the entire virtual model unavailable while it disallows use.
-- Every attached criterion must allow use: `include` requires a matching window; `exclude` requires a non-matching window.
+### Time conditions
 
-Time fields:
+`include` requires a matching window; `exclude` requires a non-matching window. Time checks run before classifier calls and are evaluated again on subsequent routing requests.
 
 | Field | Accepted values |
 | --- | --- |
 | `days` | `mon` through `sun`, or ranges such as `mon-fri`, `sat-sun`; omitted means every day |
-| `from` / `to` | `HH:MM`; start inclusive, end exclusive, with overnight windows such as `23:00` → `07:00` |
+| `from` / `to` | `HH:MM`; start inclusive, end exclusive; overnight windows such as `23:00` → `07:00` work |
 | `tz` | `local` (default), fixed offsets such as `UTC+8` or `UTC-5:30`, or IANA zones such as `Europe/Rome` |
 
-IANA zones follow daylight-saving rules. Missing time bounds cover the beginning or end of the day. Day filters use the calendar day at evaluation time, including after midnight in an overnight window.
+IANA zones follow daylight-saving rules. Missing bounds cover the beginning or end of the day. Day filters use the calendar day at evaluation time, including after midnight in an overnight window. The bundled `zaiPeak` window is editable policy, not a guarantee about your plan's billing terms.
 
-This example adds a **manual-only** night group without changing the classifier's default choices:
+### Two levels, not recursive groups
+
+- **Group criteria** decide whether automatic routing can enter that group.
+- **Candidate criteria** decide whether an individual physical model can be used inside it.
+- All time gates, credentials, and provider blocks remain mandatory.
+- Candidates are physical models, never another Rector group. No recursive rule graph is supported.
+
+This adds a time-gated group before the inherited defaults. While eligible, it prefers GLM; if the entire group is unavailable, automatic routing can continue to the inherited groups.
 
 ```json
 {
   "rector": {
     "criteria": {
       "nightOnly": {
+        "type": "time",
         "mode": "include",
         "time": { "from": "23:00", "to": "07:00", "tz": "Europe/Rome" }
       }
@@ -216,66 +199,69 @@ This example adds a **manual-only** night group without changing the classifier'
 }
 ```
 
-### Candidates and merging
+Classifier criteria can also be attached to candidates. These remain mandatory even if you manually select the containing group.
 
-A candidate is either `"provider/model"` or an object with `model`, optional `criteria`, and optional `level` (`low`, `medium`, `high`, `xhigh`). Candidates must be physical models; groups cannot nest or point back to Rector.
+### Order, merging, and thinking effort
 
-Candidate order controls preference. Adjacent entries for the same model ID on `openai` and `openai-codex` form a balanced pair. Each member still has to pass its own criteria and availability checks.
+User settings apply over defaults, then project settings over user settings:
 
-User settings are applied over defaults, then project settings over user settings:
+- `criteria` merge by name; each definition replaces the inherited definition at that name.
+- Group definitions replace inherited definitions as a whole. Groups explicitly listed in a scope come **first, in their listed order**; unmentioned inherited groups follow in their previous order.
+- Set a group to `null` to remove it. To replace the bundled policy entirely, remove unneeded defaults explicitly.
+- Group IDs contain letters, numbers, `.`, `_`, or `-`, starting with a letter or number. Purely numeric IDs are rejected because JavaScript would reorder them. `auto` is reserved.
+- An unconditional early group can shadow every later group. Put broad fallback groups last.
 
-- `criteria` and `models` merge by key. Each criterion or model definition replaces the entire inherited definition at that key.
-- Setting a model group to `null` removes it. Remove it from classifier choices too if it was listed there.
-- `classifier` merges by field; its `models` map is replaced as a whole when supplied.
-- To use only your own groups, remove the unwanted defaults with `null` and replace `classifier.models` and `fallback` accordingly.
+A candidate is `"provider/model"` or an object with `model`, optional `criteria`, and optional `level` (`low`, `medium`, `high`, `xhigh`). Candidate order determines preference, except within adjacent balanced OpenAI pairs.
 
-Invalid references, empty candidate lists, recursive Rector candidates, malformed times, unsupported levels, and unknown setting fields are rejected at load. Catalog access and credentials are checked during routing, not proven by config validation.
+**Thinking does not select a group.** `level` overrides the physical candidate's effort; otherwise selected effort passes through. Pi clamps effort to the model's supported levels.
+
+## Automatic versus manual selection
+
+| Selection | Group classifier gates | Group time gates | Candidate gates, credentials, and blocks |
+| --- | --- | --- | --- |
+| **Rector** (`rector/auto`) | Evaluated | Enforced | Enforced |
+| A group (`rector/complex`) | **Bypassed** | Enforced | Enforced |
+| A physical Pi model | Rector is bypassed entirely | — | Pi's normal behavior |
+
+Selecting Complex means “use this group”, not “let a classifier veto my choice”. It does **not** authorize ignoring time restrictions, candidate-level classifier questions, or unavailable accounts.
 
 ## How routing works
 
-1. **Choose a group.** New user turns on **Rector** invoke the classifier. Manual groups bypass it. Thinking effort does not affect group selection.
-2. **Resolve candidates.** Skip missing catalog entries, virtual candidates, missing credentials, active provider blocks, and candidates excluded by criteria.
-3. **Balance account pairs.** Prefer the eligible account already used by the session; otherwise choose the one with fewer recorded dispatches. Counts are dispatch counts, not tokens or remaining quota.
-4. **Continue consistently.** Tool follow-ups retain the selected group and physical model when still eligible. Criteria and credentials are rechecked; account affinity is a preference, not an exemption from the policy.
-5. **Handle retries through the same resolver.** If Pi requests a retry after a physical failure, block the failed provider and try eligible candidates in the same group. Candidate thinking overrides and criteria still apply.
+1. **Walk groups in order.** Automatic selection takes the first group whose conditions pass and that has a usable physical candidate. Direct group selection considers only that group.
+2. **Walk candidates.** Skip missing catalog entries, virtual models, missing credentials, active provider blocks, and unsatisfied candidate conditions. Obvious time/availability exclusions avoid unnecessary classifier calls.
+3. **Balance matching OpenAI pairs.** Adjacent entries for the same model ID on `openai` and `openai-codex` form a pair. Each must pass its own conditions. Prefer the eligible session account; otherwise choose the account with fewer recorded dispatches.
+4. **Keep the turn together.** Continuations and retries retain the chosen group. Tool follow-ups retain their physical model while eligible. Time and availability are rechecked; classifier answers are reused.
+5. **Handle a Pi-requested retry.** Block the failed provider and resolve another eligible candidate in the same group. No criteria or effort override is bypassed. A locked group with no candidate fails rather than switching groups mid-turn.
 
-The chosen group is stored in Pi's branch-local routing state. Continuations and retries do not reclassify the request. A direct request without routing state, such as a compaction summary, uses the classifier's fallback group; direct requests to a manual group still use that group.
+Automatic requests without turn state, including direct requests such as compaction, use the same ordered policy and can call classifiers. Pi records physical models on assistant responses while the selected virtual model remains visible in its selector.
 
-**An unavailable group is not a classification failure.** If the chosen group has no eligible candidates, Rector reports an error. It does not silently downgrade from Complex to Simple or use a different group. Standard contains GLM/Terra only, not Luna.
+### Blocks and local state
 
-### Failure blocks and local state
+Physical assistant errors observed while using Rector create provider-wide blocks. Reset parsing recognizes date-time stamps and durations such as `2 hours and 30 minutes`. Date-time stamps are clamped to one minute–seven days ahead; durations are capped at five hours. Unrecognized reset information uses 30 minutes. A bare clock time such as `15:30` is not a recognized timestamp.
 
-Errors from physical models routed through Rector create provider-wide blocks. Reset parsing recognizes date-time stamps and durations such as `2 hours and 30 minutes`. Date-time stamps are clamped to one minute–seven days ahead; summed durations are capped at five hours. Unrecognized reset information uses a 30-minute block. Bare clock times such as `15:30` are not recognized as timestamps.
+Only newly observed successful responses clear blocks; historical successful responses do not. Selecting a normal physical model does not update Rector state.
 
-A newly observed successful response clears that provider's block; historical successful responses do not. Using a physical model directly does not update Rector's state.
-
-`router-usage.json`, beside the extension, persists dispatch counts and block deadlines. Keep the installation writable for persistence. State contains routing metadata rather than prompts or credentials. It is not authoritative quota telemetry, and concurrent Pi processes can overwrite one another's updates.
+`router-usage.json`, beside the extension, persists dispatch counts and block deadlines. It contains routing metadata rather than prompts or credentials. Counts are not token usage or remaining quota. Keep the installation writable for persistence; separate installations have separate state, and concurrent processes can overwrite one another's updates.
 
 ## Current limitations
 
-- **Same-request failover depends on Pi requesting a retry.** Rector does not start its own retry loop or replay a failed request automatically.
-- **Blocks are provider-wide, not model-specific.** A Terra error can also exclude Luna on the same provider.
-- **Errors are not yet classified by cause.** Transient network failures can create the same block as exhausted quota.
-- **Classifier rules are semantic.** Ambiguous descriptions can produce unexpected group choices; fallback is not a guarantee of classification quality.
-- **Persistence is best-effort.** An unwritable installation loses routing history; separate installations have separate state.
+- Same-request failover depends on Pi requesting a retry; Rector does not replay failed requests itself.
+- Failure blocks are provider-wide, not model-specific. They do not distinguish quota exhaustion from transient network errors.
+- A boolean classifier can satisfy multiple group conditions; order is part of the policy and must be reviewed.
+- Initial automatic selection may use a later, less capable group if an earlier group cannot serve the request. Continuations and retries do not switch groups.
+- Persistence is best-effort and not safe for concurrent writers.
 
-## Migrating from autoRouter
+## Migration
 
-Existing `autoRouter` settings are temporarily converted **in memory**, with a deprecation warning. No settings files are rewritten. If `rector` exists in either settings scope, it takes precedence and the legacy section is ignored entirely.
+Older `autoRouter`, the former `rector.classifier` selector, and untyped time criteria are temporarily converted **in memory** with a warning. No settings files or saved selections are rewritten. If `rector` exists in either scope, `autoRouter` is ignored entirely.
 
-| Old concept | New concept |
-| --- | --- |
-| `autoRouter.workloads.<key>` | `rector.models.<key>.candidates` |
-| `autoRouter.criteria` | `rector.criteria` |
-| Pool with `workload` and `providers` | One group with an explicit, filtered candidate list |
-| Fixed classifier categories | Configurable `rector.classifier.models` descriptions |
-| `auto/smart` | **Rector**, `rector/auto` |
-| `auto/openai`, `auto/zai` | Configure provider-specific groups explicitly |
-| Bundled Sol/Terra/Luna pools | `rector/complex`, `rector/standard`, `rector/simple` under the new defaults |
+- Former classifier choices become boolean group gates containing the original instructions and category descriptions. The old fallback is placed after the other listed categories.
+- Legacy workloads become model groups; explicitly configured pools become additional groups with filtered candidate lists. Invalid references or empty lists fail validation.
+- Untyped time conditions acquire `type: "time"`.
+- **Compatibility is structural, not identical classification behavior:** exclusive categories become independent yes/no questions, and automatic routing now selects the first usable matching group. Review the generated intent and migrate explicitly rather than relying on identical decisions.
+- Replace the former top-level `classifier` section with named classifier criteria, and attach those criteria to the relevant groups. Keep a fallback group last if desired.
 
-Legacy conversion keeps workload keys, including `trivial`, and explicitly configured pools become additional groups. Provider filters are applied to their candidate lists before balancing. Unknown workloads, conflicting group IDs, or filters that produce empty pools fail validation instead of silently changing intent.
-
-**Old `auto/` model IDs are not registered.** Reselect Rector or a group after reload and update any saved defaults or CLI arguments. For Rector as the startup selection, merge this into your settings:
+The selection IDs remain `rector/auto` and `rector/<group>`. Old `auto/` IDs are not registered. For Rector as the startup selection, merge:
 
 ```json
 {
@@ -284,21 +270,19 @@ Legacy conversion keeps workload keys, including `trivial`, and explicitly confi
 }
 ```
 
-Thinking-to-category shortcuts are removed even in legacy compatibility mode. To force a category, select its virtual model directly.
-
 ## Troubleshooting
 
 | Symptom | What to check |
 | --- | --- |
-| Rector does not appear | Confirm the package is enabled, reload Pi, and inspect load errors. Your Pi needs virtual-model support. |
-| A custom group is missing | Check `rector.models`, its ID, and reload. User settings must be in the agent directory. |
-| `no candidate available` | Inspect the listed reasons: catalog, credentials, block deadlines, or criteria. Rector will not switch groups silently. |
-| Always uses the fallback group | Check your classifier ID, credentials, availability, and semantic rules. A compatible classifier must be registered in Pi. |
-| One OpenAI account gets most dispatches | Session affinity takes priority over counts. Verify both pair members are adjacent, eligible, and authenticated as intended. |
-| A manual group is excluded | Check its group-level criteria. Manual selection bypasses classification, not eligibility checks. |
-| An old model selection fails after upgrade | Replace `auto/smart` with `rector/auto`, or select one of the newly registered groups. |
+| Rector or a custom group is missing | Confirm the extension is enabled, inspect load errors, check the agent directory, and reload. |
+| Unexpected group selected | Check resolved group order, overlapping classifier questions, and unconditional groups that shadow later entries. |
+| Always uses the last fallback | Check classifier availability, credentials, questions, and returned probabilities. Failed classifier gates do not pass. |
+| `no eligible model group` | No group could serve the request. Review the listed criteria, credentials, catalog entries, and block deadlines. |
+| Manual selection fails | Group time gates and all candidate gates still apply. Selecting a group does not bypass them. |
+| A turn stops instead of switching groups | Continuations and retries stay in the selected group; cross-group fallback is only for a fresh automatic selection. |
+| One OpenAI account gets most dispatches | Session affinity wins over counts. Confirm both matching entries are adjacent, eligible, and authenticated as intended. |
 
-To reset routing history, stop Pi instances using the installation and back up `router-usage.json` before removing it. This resets **both** counts and provider blocks, not provider quota.
+To reset history, stop Pi instances using the installation and back up `router-usage.json` before removing it. This resets both counts and blocks, not provider quota.
 
 ## Development
 
@@ -308,9 +292,9 @@ npx tsc --noEmit
 npm test
 ```
 
-The extension ships as `auto-router.ts` without a build step. Tests use Node's built-in runner and assertions, mocked classifiers/catalogs, and temporary configuration fixtures — no provider calls or real credentials. CI runs on Node 22 and 24.
+The extension ships as `auto-router.ts`, without a build step. Tests use Node's built-in runner, mocked classifiers/catalogs, temporary settings, and an offline Pi runtime. CI runs on Node 22 and 24. No real provider calls or credentials are needed.
 
-Found a bug? [Open an issue](https://github.com/tonyputi/pi-rector/issues) with sanitized configuration, the selected virtual model, and reproduction steps. Never include credentials or private prompts.
+[Report a bug](https://github.com/tonyputi/pi-rector/issues) with sanitized configuration, selected model, and reproduction steps. Never include credentials or private prompts.
 
 ## Code of conduct
 

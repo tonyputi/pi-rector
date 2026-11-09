@@ -1,5 +1,6 @@
 /** Rector: configurable virtual model groups, selected manually or by a classifier. */
 import { readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Api, AssistantMessage, Message, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
@@ -16,10 +17,9 @@ export interface TimeSpec {
 	to?: string;
 	tz?: string;
 }
-export interface Criterion {
-	mode: "include" | "exclude";
-	time: TimeSpec;
-}
+export type Criterion =
+	| { type: "time"; mode: "include" | "exclude"; time: TimeSpec }
+	| { type: "classifier"; model: string; instructions: string };
 export type Candidate = string | { model: string; criteria?: string[]; level?: ModelThinkingLevel };
 export interface ModelSpec {
 	name?: string;
@@ -27,18 +27,14 @@ export interface ModelSpec {
 	candidates: Candidate[];
 }
 export interface RectorConfig {
-	classifier: {
-		model: string;
-		instructions: string;
-		models: Record<string, string>;
-		fallback: string;
-	};
 	criteria: Record<string, Criterion>;
 	models: Record<string, ModelSpec>;
 }
 export interface RouterState {
 	group: string;
 	openaiProvider?: string;
+	matches?: Record<string, boolean>;
+	criteriaVersion?: string;
 }
 export interface Usage {
 	counts: Record<string, number>;
@@ -47,35 +43,29 @@ export interface Usage {
 type Registry = Pick<ExtensionContext["modelRegistry"], "find" | "findOfType" | "classify" | "hasConfiguredAuth">;
 
 const DEFAULTS: RectorConfig = {
-	classifier: {
-		model: "opencode/jev-1.13-free",
-		instructions: "Choose the model group best suited to the user's request in `prompt`.",
-		models: {
-			simple: "Short answers, simple lookups, and straightforward small edits.",
-			standard: "Ordinary implementation, bug fixes, reviews, and explanations.",
-			complex: "Architecture, difficult debugging, and cross-cutting changes.",
-		},
-		fallback: "standard",
-	},
 	criteria: {
-		zaiPeak: { mode: "exclude", time: { days: ["mon-fri"], from: "14:00", to: "18:00", tz: "UTC+8" } },
+		simpleTask: { type: "classifier", model: "opencode/jev-1.13-free", instructions: "Is the request in `prompt` a short answer, simple lookup, or straightforward small edit?" },
+		complexTask: { type: "classifier", model: "opencode/jev-1.13-free", instructions: "Does the request in `prompt` require architecture, difficult debugging, or cross-cutting changes rather than ordinary implementation?" },
+		zaiPeak: { type: "time", mode: "exclude", time: { days: ["mon-fri"], from: "14:00", to: "18:00", tz: "UTC+8" } },
 	},
 	models: {
 		simple: {
 			name: "Simple",
+			criteria: ["simpleTask"],
 			candidates: [
 				{ model: "zai/glm-5.3-flash", criteria: ["zaiPeak"] },
 				{ model: "openai/gpt-6-luna", level: "high" },
 				{ model: "openai-codex/gpt-6-luna", level: "high" },
 			],
 		},
+		complex: {
+			name: "Complex",
+			criteria: ["complexTask"],
+			candidates: [{ model: "openai/gpt-6.1-sol", level: "medium" }, { model: "openai-codex/gpt-6.1-sol", level: "medium" }],
+		},
 		standard: {
 			name: "Standard",
 			candidates: [{ model: "zai/glm-5.3", criteria: ["zaiPeak"] }, "openai/gpt-6.1-terra", "openai-codex/gpt-6.1-terra"],
-		},
-		complex: {
-			name: "Complex",
-			candidates: [{ model: "openai/gpt-6.1-sol", level: "medium" }, { model: "openai-codex/gpt-6.1-sol", level: "medium" }],
 		},
 	},
 };
@@ -105,28 +95,37 @@ function references(value: unknown, criteria: Record<string, unknown>, label: st
 
 export function validateConfig(value: unknown): asserts value is RectorConfig {
 	const config = record(value, "rector");
-	knownKeys(config, ["classifier", "criteria", "models"], "rector");
+	knownKeys(config, ["criteria", "models"], "rector");
 	const criteria = record(config.criteria, "rector.criteria");
 	for (const [name, value] of Object.entries(criteria)) {
-		const criterion = record(value, `rector.criteria.${name}`);
-		knownKeys(criterion, ["mode", "time"], `rector.criteria.${name}`);
-		if (criterion.mode !== "include" && criterion.mode !== "exclude") throw new Error(`rector.criteria.${name}: invalid mode`);
-		const time = record(criterion.time, `rector.criteria.${name}.time`);
-		knownKeys(time, ["days", "from", "to", "tz"], `rector.criteria.${name}.time`);
+		const label = `rector.criteria.${name}`;
+		const criterion = record(value, label);
+		if (criterion.type === "classifier") {
+			knownKeys(criterion, ["type", "model", "instructions"], label);
+			modelParts(criterion.model, `${label}.model`);
+			text(criterion.instructions, `${label}.instructions`);
+			continue;
+		}
+		if (criterion.type !== "time") throw new Error(`${label}: type must be time or classifier`);
+		knownKeys(criterion, ["type", "mode", "time"], label);
+		if (criterion.mode !== "include" && criterion.mode !== "exclude") throw new Error(`${label}: invalid mode`);
+		const time = record(criterion.time, `${label}.time`);
+		knownKeys(time, ["days", "from", "to", "tz"], `${label}.time`);
 		if (time.days !== undefined) {
-			if (!Array.isArray(time.days) || time.days.some((day) => typeof day !== "string")) throw new Error(`rector.criteria.${name}: invalid days`);
+			if (!Array.isArray(time.days) || time.days.some((day) => typeof day !== "string")) throw new Error(`${label}: invalid days`);
 			parseDays(time.days);
 		}
 		for (const bound of ["from", "to"]) if (time[bound] !== undefined) {
-			text(time[bound], `rector.criteria.${name}.${bound}`);
+			text(time[bound], `${label}.${bound}`);
 			parseHHMM(time[bound]);
 		}
-		if (time.tz !== undefined) text(time.tz, `rector.criteria.${name}.tz`);
+		if (time.tz !== undefined) text(time.tz, `${label}.tz`);
 		localParts(time.tz as string | undefined, new Date());
 	}
 	const models = record(config.models, "rector.models");
+	if (!Object.keys(models).length) throw new Error("rector.models must not be empty");
 	for (const [id, value] of Object.entries(models)) {
-		if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(id) || id === "auto") throw new Error(`rector.models: invalid or reserved id "${id}"`);
+		if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(id) || /^\d+$/.test(id) || id === "auto") throw new Error(`rector.models: invalid or reserved id "${id}"`);
 		const spec = record(value, `rector.models.${id}`);
 		knownKeys(spec, ["name", "criteria", "candidates"], `rector.models.${id}`);
 		if (spec.name !== undefined) text(spec.name, `rector.models.${id}.name`);
@@ -142,30 +141,55 @@ export function validateConfig(value: unknown): asserts value is RectorConfig {
 			if (entry.level !== undefined && !(LEVELS as readonly unknown[]).includes(entry.level)) throw new Error(`${label}: invalid level`);
 		}
 	}
-	const classifier = record(config.classifier, "rector.classifier");
-	knownKeys(classifier, ["model", "instructions", "models", "fallback"], "rector.classifier");
-	modelParts(classifier.model, "rector.classifier.model");
-	text(classifier.instructions, "rector.classifier.instructions");
-	const choices = record(classifier.models, "rector.classifier.models");
-	if (!Object.keys(choices).length) throw new Error("rector.classifier.models must not be empty");
+}
+
+const OLD_CLASSIFIER = {
+	model: "opencode/jev-1.13-free",
+	instructions: "Choose the model group best suited to the user's request in `prompt`.",
+	models: {
+		simple: "Short answers, simple lookups, and straightforward small edits.",
+		standard: "Ordinary implementation, bug fixes, reviews, and explanations.",
+		complex: "Architecture, difficult debugging, and cross-cutting changes.",
+	},
+	fallback: "standard",
+};
+
+/** Compatibility only: convert the former selector to boolean gates, with its fallback last. */
+function migrateSelector(raw: Record<string, unknown>): void {
+	const selector = { ...OLD_CLASSIFIER, ...record(raw.classifier, "rector.classifier") };
+	knownKeys(selector, ["model", "instructions", "models", "fallback"], "rector.classifier");
+	modelParts(selector.model, "rector.classifier.model");
+	text(selector.instructions, "rector.classifier.instructions");
+	const choices = record(selector.models, "rector.classifier.models");
+	const models = record(raw.models, "rector.models");
+	const criteria = record(raw.criteria, "rector.criteria");
+	text(selector.fallback, "rector.classifier.fallback");
+	if (!Object.hasOwn(choices, selector.fallback)) throw new Error("rector.classifier.fallback must name a classifier model group");
 	for (const [id, rule] of Object.entries(choices)) {
 		if (!Object.hasOwn(models, id)) throw new Error(`rector.classifier.models: unknown model group "${id}"`);
 		text(rule, `rector.classifier.models.${id}`);
+		if (id === selector.fallback) continue;
+		const name = `select-${id}`;
+		if (Object.hasOwn(criteria, name)) throw new Error(`Migration criterion "${name}" already exists; migrate rector.classifier manually`);
+		criteria[name] = { type: "classifier", model: selector.model, instructions: `${selector.instructions}\nAvailable groups: ${JSON.stringify(choices)}\nAnswer true only if "${id}" is the best matching group.` };
+		const spec = record(models[id], `rector.models.${id}`);
+		references(spec.criteria, criteria, `rector.models.${id}.criteria`);
+		models[id] = { ...spec, criteria: [...(spec.criteria as string[] | undefined ?? []), name] };
 	}
-	text(classifier.fallback, "rector.classifier.fallback");
-	if (!Object.hasOwn(choices, classifier.fallback)) throw new Error("rector.classifier.fallback must name a classifier model group");
+	const order = [...Object.keys(choices).filter((id) => id !== selector.fallback), selector.fallback];
+	raw.models = { ...Object.fromEntries(order.map((id) => [id, models[id]])), ...Object.fromEntries(Object.entries(models).filter(([id]) => !Object.hasOwn(choices, id))) };
+	delete raw.classifier;
 }
 
 /** Convert legacy settings in memory only; no user files or stored selections are rewritten. */
-function legacyConfig(user: Record<string, unknown>, project: Record<string, unknown>): RectorConfig {
+function legacyConfig(user: Record<string, unknown>, project: Record<string, unknown>): Record<string, unknown> {
 	const a = user.autoRouter === undefined ? {} : record(user.autoRouter, "autoRouter");
 	const b = project.autoRouter === undefined ? {} : record(project.autoRouter, "autoRouter");
 	const section = (source: Record<string, unknown>, key: string) => source[key] === undefined ? {} : record(source[key], `autoRouter.${key}`);
-	const tiers = { trivial: DEFAULTS.models.simple.candidates, standard: DEFAULTS.models.standard.candidates, complex: DEFAULTS.models.complex.candidates, ...section(a, "workloads"), ...section(b, "workloads") };
+	const tiers = { trivial: DEFAULTS.models.simple.candidates, complex: DEFAULTS.models.complex.candidates, standard: DEFAULTS.models.standard.candidates, ...section(a, "workloads"), ...section(b, "workloads") };
 	const groups: Record<string, ModelSpec> = {};
 	for (const [id, candidates] of Object.entries(tiers)) groups[id] = { candidates: candidates as Candidate[] };
-	const pools = { ...section(a, "models"), ...section(b, "models") };
-	for (const [id, value] of Object.entries(pools)) {
+	for (const [id, value] of Object.entries({ ...section(a, "models"), ...section(b, "models") })) {
 		if (value === null) continue;
 		if (["smart", "zai", "openai"].includes(id) || Object.hasOwn(tiers, id)) throw new Error(`autoRouter.models.${id} conflicts with a router or workload; migrate to rector.models`);
 		const pool = record(value, `autoRouter.models.${id}`);
@@ -180,32 +204,46 @@ function legacyConfig(user: Record<string, unknown>, project: Record<string, unk
 		groups[id] = { name: pool.name as string | undefined, criteria: pool.criteria as string[] | undefined, candidates: candidates as Candidate[] };
 	}
 	return {
-		classifier: { ...DEFAULTS.classifier, models: { trivial: DEFAULTS.classifier.models.simple, standard: DEFAULTS.classifier.models.standard, complex: DEFAULTS.classifier.models.complex } },
-		criteria: { ...DEFAULTS.criteria, ...section(a, "criteria"), ...section(b, "criteria") } as Record<string, Criterion>,
+		classifier: { ...OLD_CLASSIFIER, models: { trivial: OLD_CLASSIFIER.models.simple, complex: OLD_CLASSIFIER.models.complex, standard: OLD_CLASSIFIER.models.standard } },
+		criteria: { zaiPeak: DEFAULTS.criteria.zaiPeak, ...section(a, "criteria"), ...section(b, "criteria") },
 		models: groups,
 	};
 }
 
 export function resolveConfig(user: Record<string, unknown> = {}, project: Record<string, unknown> = {}): { config: RectorConfig; legacy: boolean } {
 	const hasRector = user.rector !== undefined || project.rector !== undefined;
-	const legacy = user.autoRouter !== undefined || project.autoRouter !== undefined;
-	let config: RectorConfig;
-	if (legacy && !hasRector) config = legacyConfig(user, project);
+	let legacy = user.autoRouter !== undefined || project.autoRouter !== undefined;
+	let raw: Record<string, unknown>;
+	if (legacy && !hasRector) raw = legacyConfig(user, project);
 	else {
-		let merged: Record<string, unknown> = structuredClone(DEFAULTS) as unknown as Record<string, unknown>;
-		for (const settings of [user, project]) {
-			if (settings.rector === undefined) continue;
-			const custom = record(settings.rector, "rector");
+		const scopes = [user, project].filter((settings) => settings.rector !== undefined).map((settings) => record(settings.rector, "rector"));
+		const oldSelector = scopes.some((scope) => scope.classifier !== undefined);
+		raw = structuredClone(DEFAULTS) as unknown as Record<string, unknown>;
+		if (oldSelector) {
+			raw.classifier = structuredClone(OLD_CLASSIFIER);
+			raw.models = Object.fromEntries(Object.entries(DEFAULTS.models).map(([id, spec]) => [id, { ...spec, criteria: undefined }]));
+			legacy = true;
+		}
+		for (const custom of scopes) {
 			knownKeys(custom, ["classifier", "criteria", "models"], "rector");
 			for (const key of ["classifier", "criteria", "models"]) if (custom[key] !== undefined) {
-				merged[key] = { ...record(merged[key], key), ...record(custom[key], `rector.${key}`) };
+				const entries = record(custom[key], `rector.${key}`);
+				const inherited = record(raw[key], key);
+				raw[key] = key === "models"
+					? { ...entries, ...Object.fromEntries(Object.entries(inherited).filter(([id]) => !Object.hasOwn(entries, id))) }
+					: { ...inherited, ...entries };
 			}
 		}
-		merged.models = Object.fromEntries(Object.entries(record(merged.models, "rector.models")).filter(([, value]) => value !== null));
-		config = merged as unknown as RectorConfig;
 	}
-	validateConfig(config);
-	return { config, legacy };
+	raw.models = Object.fromEntries(Object.entries(record(raw.models, "rector.models")).filter(([, value]) => value !== null));
+	if (raw.classifier !== undefined) migrateSelector(raw);
+	raw.criteria = Object.fromEntries(Object.entries(record(raw.criteria, "rector.criteria")).map(([name, value]) => {
+		const criterion = record(value, `rector.criteria.${name}`);
+		if (criterion.type === undefined && criterion.time !== undefined) { legacy = true; return [name, { type: "time", ...criterion }]; }
+		return [name, criterion];
+	}));
+	validateConfig(raw);
+	return { config: raw, legacy };
 }
 
 function readSettings(path: string): Record<string, unknown> {
@@ -273,9 +311,10 @@ export function timeMatches(spec: TimeSpec, now: Date): boolean {
 	const from = spec.from ? parseHHMM(spec.from) : 0, to = spec.to ? parseHHMM(spec.to) : 24 * 60;
 	return from <= to ? parts.minutes >= from && parts.minutes < to : parts.minutes >= from || parts.minutes < to;
 }
-function allowed(names: string[] | undefined, criteria: Record<string, Criterion>, now: Date): boolean {
+function timeAllowed(names: string[] | undefined, criteria: Record<string, Criterion>, now: Date): boolean {
 	return (names ?? []).every((name) => {
 		const def = criteria[name];
+		if (def.type !== "time") return true;
 		return def.mode === "include" ? timeMatches(def.time, now) : !timeMatches(def.time, now);
 	});
 }
@@ -310,83 +349,145 @@ function lastUserText(messages: readonly Message[]): string {
 	const content = messages.filter((message) => message.role === "user").at(-1)?.content ?? "";
 	return typeof content === "string" ? content : content.flatMap((part) => part.type === "text" ? [part.text] : []).join("\n");
 }
-async function classify(config: RectorConfig, request: ModelRouteRequest<RouterState>, registry: Registry, now: Date): Promise<string> {
-	const { classifier, models, criteria } = config;
-	const choices = Object.fromEntries(Object.entries(classifier.models).filter(([id]) => allowed(models[id].criteria, criteria, now)));
-	if (!Object.keys(choices).length) throw new Error("Rector: no model group is eligible under its criteria");
-	const fallback = () => {
-		if (!Object.hasOwn(choices, classifier.fallback)) throw new Error(`Rector: fallback group "${classifier.fallback}" is excluded by criteria`);
-		return classifier.fallback;
+/** Evaluate each referenced classifier once per prompt; group and candidate gates share answers. */
+function criteriaEvaluator(config: RectorConfig, request: ModelRouteRequest<RouterState>, registry: Registry, now: Date, needed: Set<string>) {
+	const version = createHash("sha256").update(JSON.stringify(config.criteria)).digest("hex");
+	const reuse = request.reason !== "user" && request.state?.criteriaVersion === version;
+	const answers = new Map<string, boolean>(reuse ? Object.entries(request.state?.matches ?? {}).filter(([name, value]) => needed.has(name) && typeof value === "boolean") : []);
+	let changed = !reuse;
+	const evaluate = async (name: string): Promise<boolean> => {
+		if (answers.has(name)) return answers.get(name)!;
+		const def = config.criteria[name];
+		if (def.type !== "classifier") throw new Error("Expected a classifier criterion");
+		const batch = [...needed].filter((key) => {
+			const other = config.criteria[key];
+			return other.type === "classifier" && other.model === def.model && !answers.has(key);
+		});
+		// Default every answer to false; a missing model, refusal, or error must not open a gate.
+		for (const key of batch) answers.set(key, false);
+		changed = true;
+		try {
+			const [provider, id] = modelParts(def.model, "classifier criterion");
+			const model = registry.findOfType("classifier", provider, id);
+			if (!model) return false;
+			const result = await registry.classify(model, {
+				state: { prompt: lastUserText(request.messages).slice(0, 16_000) },
+				questions: Object.fromEntries(batch.map((key, index) => {
+					const criterion = config.criteria[key] as Extract<Criterion, { type: "classifier" }>;
+					return [`q${index}`, { type: "bool" as const, instructions: criterion.instructions, criteria: { true: "The condition is satisfied.", false: "The condition is not satisfied." } }];
+				})),
+			}, { signal: request.signal });
+			request.signal?.throwIfAborted();
+			if (result.stopReason === "aborted") throw new DOMException("Rector classification aborted", "AbortError");
+			if (result.stopReason === "stop") batch.forEach((key, index) => {
+				const answer = result.answers[`q${index}`];
+				answers.set(key, answer?.type === "bool" && Number.isFinite(answer.probability) && answer.probability >= 0.5 && answer.probability <= 1);
+			});
+		} catch (error) {
+			request.signal?.throwIfAborted();
+			if (error instanceof Error && error.name === "AbortError") throw error;
+			// shortcut: classifier errors close their gates; use an unconditional last group for fallback.
+		}
+		return answers.get(name)!;
 	};
-	const [provider, id] = modelParts(classifier.model, "rector.classifier.model");
-	const model = registry.findOfType("classifier", provider, id);
-	if (!model) return fallback();
-	try {
-		const result = await registry.classify(model, {
-			state: { prompt: lastUserText(request.messages).slice(0, 16_000) },
-			questions: { model: { type: "choice", instructions: classifier.instructions, criteria: choices } },
-		}, { signal: request.signal });
-		request.signal?.throwIfAborted();
-		if (result.stopReason === "aborted") throw new DOMException("Rector classification aborted", "AbortError");
-		const answer = result.stopReason === "stop" ? result.answers.model : undefined;
-		if (answer?.type === "choice" && Object.hasOwn(choices, answer.choice)) return answer.choice;
-	} catch (error) {
-		request.signal?.throwIfAborted();
-		if (error instanceof Error && error.name === "AbortError") throw error;
-		// shortcut: unavailable classifiers use the configured fallback; no chat-model adapter.
-	}
-	return fallback();
+	return {
+		version,
+		get changed() { return changed; },
+		results: () => Object.fromEntries(answers),
+		async allows(names: string[] | undefined, skipClassifiers = false): Promise<boolean> {
+			if (!timeAllowed(names, config.criteria, now)) return false;
+			for (const name of names ?? []) {
+				if (!skipClassifiers && config.criteria[name].type === "classifier" && !(await evaluate(name))) return false;
+			}
+			return true;
+		},
+	};
 }
 
-/** One resolver for automatic selection, manual groups, continuations, and retries. */
+/** Resolve two levels only: ordered groups, then physical candidates. */
 export async function routeRequest(config: RectorConfig, groupId: string | undefined, request: ModelRouteRequest<RouterState>, registry: Registry, usage: Usage, now = new Date()): Promise<ModelRoute<RouterState>> {
 	request.signal?.throwIfAborted();
 	if (request.reason === "retry" && request.failed) block(usage, request.failed.model.provider, request.failed.message.errorMessage, now.getTime());
-	const group = groupId ?? (request.reason === "user" ? await classify(config, request, registry, now) : request.state?.group ?? config.classifier.fallback);
-	const spec = config.models[group];
-	if (!spec) throw new Error(`Rector: unknown model group "${group}"; reload Pi after changing configuration`);
-	if (!allowed(spec.criteria, config.criteria, now)) throw new Error(`rector/${group} is excluded by its criteria`);
+	const locked = groupId ?? (request.reason !== "user" && request.reason !== "direct" ? request.state?.group : undefined);
+	const groups = locked === undefined ? Object.keys(config.models) : [locked];
+	const needed = new Set<string>();
+	for (const group of groups) {
+		if (!Object.hasOwn(config.models, group)) throw new Error(`Rector: unknown model group "${group}"; reload Pi after changing configuration`);
+		const spec = config.models[group];
+		for (const name of spec.criteria ?? []) if (groupId === undefined || config.criteria[name].type !== "classifier") needed.add(name);
+		for (const entry of spec.candidates) if (typeof entry !== "string") for (const name of entry.criteria ?? []) needed.add(name);
+	}
+	const evaluator = criteriaEvaluator(config, request, registry, now, needed);
 	const skipped: string[] = [];
-	const candidates = spec.candidates.map((entry) => typeof entry === "string" ? { model: entry } : entry);
-	const usable = (entry: (typeof candidates)[number]): Model<Api> | undefined => {
-		const [provider, id] = modelParts(entry.model, "candidate");
-		const model = registry.find(provider, id);
-		let reason: string | undefined;
-		if (!model) reason = "not in catalog";
-		else if (model.api === "pi-virtual") reason = "not a physical model";
-		else if (!registry.hasConfiguredAuth(model)) reason = "no credentials";
-		else if ((usage.blocked[provider] ?? 0) > now.getTime()) reason = `blocked until ${new Date(usage.blocked[provider]).toISOString()}`;
-		else if (!allowed(entry.criteria, config.criteria, now)) reason = "criteria";
-		if (reason) { skipped.push(`${entry.model}: ${reason}`); return undefined; }
-		return model;
-	};
-	const dispatch = (entry: (typeof candidates)[number], model: Model<Api>): ModelRoute<RouterState> => {
-		const state: RouterState = { group, openaiProvider: request.state?.openaiProvider };
-		if ((OPENAI as readonly string[]).includes(model.provider)) {
-			state.openaiProvider = model.provider;
-			usage.counts[model.provider] = (usage.counts[model.provider] ?? 0) + 1;
+	for (const group of groups) {
+		const spec = config.models[group];
+		if (!timeAllowed(spec.criteria, config.criteria, now)) {
+			skipped.push(`rector/${group}: excluded by group time criteria`);
+			continue;
 		}
-		return { model, thinkingLevel: entry.level ?? request.thinkingLevel, state };
-	};
-	if (request.reason === "continuation" && request.previous && request.state?.group === group) {
-		const entry = candidates.find((entry) => entry.model === `${request.previous!.model.provider}/${request.previous!.model.id}` && usable(entry));
-		if (entry) return { model: request.previous.model, thinkingLevel: entry.level ?? request.previous.thinkingLevel ?? request.thinkingLevel, state: request.state };
-	}
-	for (let i = 0; i < candidates.length; i++) {
-		const entry = candidates[i], next = candidates[i + 1];
-		const [provider, id] = modelParts(entry.model, "candidate");
-		const nextParts = next ? modelParts(next.model, "candidate") : undefined;
-		if ((OPENAI as readonly string[]).includes(provider) && nextParts && (OPENAI as readonly string[]).includes(nextParts[0]) && nextParts[0] !== provider && nextParts[1] === id) {
-			i++;
-			const pool = [entry, next].flatMap((candidate) => { const model = usable(candidate); return model ? [{ entry: candidate, model }] : []; });
-			if (!pool.length) continue;
-			const chosen = pool.find(({ model }) => model.provider === request.state?.openaiProvider) ?? pool.reduce((best, item) => (usage.counts[item.model.provider] ?? 0) < (usage.counts[best.model.provider] ?? 0) ? item : best);
-			return dispatch(chosen.entry, chosen.model);
+		const candidates = spec.candidates.map((entry) => typeof entry === "string" ? { model: entry } : entry);
+		const physical = candidates.map((entry) => {
+			const [provider, id] = modelParts(entry.model, "candidate");
+			const model = registry.find(provider, id);
+			let reason: string | undefined;
+			if (!model) reason = "not in catalog";
+			else if (model.api === "pi-virtual") reason = "not a physical model";
+			else if (!registry.hasConfiguredAuth(model)) reason = "no credentials";
+			else if ((usage.blocked[provider] ?? 0) > now.getTime()) reason = `blocked until ${new Date(usage.blocked[provider]).toISOString()}`;
+			else if (!timeAllowed(entry.criteria, config.criteria, now)) reason = "candidate time criteria";
+			if (reason) { skipped.push(`rector/${group} ${entry.model}: ${reason}`); return undefined; }
+			return model;
+		});
+		if (!physical.some(Boolean)) continue;
+		if (!(await evaluator.allows(spec.criteria, groupId !== undefined))) {
+			skipped.push(`rector/${group}: group criteria [${(spec.criteria ?? []).join(", ")}] not satisfied`);
+			continue;
 		}
-		const model = usable(entry);
-		if (model) return dispatch(entry, model);
+		const usable = async (index: number): Promise<Model<Api> | undefined> => {
+			const model = physical[index];
+			if (!model) return undefined;
+			if (await evaluator.allows(candidates[index].criteria)) return model;
+			skipped.push(`rector/${group} ${candidates[index].model}: candidate criteria not satisfied`);
+			return undefined;
+		};
+		const dispatch = (index: number, model: Model<Api>, sticky = false): ModelRoute<RouterState> => {
+			const entry = candidates[index];
+			const state: RouterState = { group, openaiProvider: request.state?.openaiProvider, matches: evaluator.results(), criteriaVersion: evaluator.version };
+			if ((OPENAI as readonly string[]).includes(model.provider)) {
+				state.openaiProvider = model.provider;
+				if (!sticky) usage.counts[model.provider] = (usage.counts[model.provider] ?? 0) + 1;
+			}
+			return {
+				model,
+				thinkingLevel: entry.level ?? (sticky ? request.previous?.thinkingLevel ?? request.thinkingLevel : request.thinkingLevel),
+				state: sticky && !evaluator.changed ? request.state : state,
+			};
+		};
+		if (request.reason === "continuation" && request.previous && request.state?.group === group) {
+			for (let i = 0; i < candidates.length; i++) {
+				if (candidates[i].model !== `${request.previous.model.provider}/${request.previous.model.id}`) continue;
+				const model = await usable(i);
+				if (model) return dispatch(i, model, true);
+			}
+		}
+		for (let i = 0; i < candidates.length; i++) {
+			const entry = candidates[i], next = candidates[i + 1];
+			const [provider, id] = modelParts(entry.model, "candidate");
+			const nextParts = next ? modelParts(next.model, "candidate") : undefined;
+			if ((OPENAI as readonly string[]).includes(provider) && nextParts && (OPENAI as readonly string[]).includes(nextParts[0]) && nextParts[0] !== provider && nextParts[1] === id) {
+				const pool: { index: number; model: Model<Api> }[] = [];
+				for (const index of [i, i + 1]) { const model = await usable(index); if (model) pool.push({ index, model }); }
+				i++;
+				if (!pool.length) continue;
+				const chosen = pool.find(({ model }) => model.provider === request.state?.openaiProvider) ?? pool.reduce((best, item) => (usage.counts[item.model.provider] ?? 0) < (usage.counts[best.model.provider] ?? 0) ? item : best);
+				return dispatch(chosen.index, chosen.model);
+			}
+			const model = await usable(i);
+			if (model) return dispatch(i, model);
+		}
 	}
-	throw new Error(`rector/${group}: no candidate available (${skipped.join("; ")})`);
+	const label = locked === undefined ? "Rector: no eligible model group with an available candidate" : `rector/${locked}: no candidate available`;
+	throw new Error(`${label} (${skipped.join("; ")})`);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -395,7 +496,7 @@ export default function (pi: ExtensionAPI) {
 	const { config, legacy } = resolveConfig(user, project);
 	const usesProject = project.rector !== undefined || (user.rector === undefined && project.autoRouter !== undefined);
 	if (legacy) pi.on("session_start", (_event, ctx) => {
-		ctx.ui.notify("autoRouter is deprecated. Migrate to rector and select rector/auto (Rector) or rector/<group>. If rector is present, autoRouter is ignored. Thinking no longer selects a group.", "warning");
+		ctx.ui.notify("Legacy Rector settings detected. Migrate to typed rector.criteria and ordered rector.models. Classifier choices are converted to boolean gates; Auto now uses the first usable matching group. No files were rewritten.", "warning");
 	});
 	for (const [id, name] of [["auto", "Rector"], ...Object.entries(config.models).map(([id, spec]) => [id, spec.name ?? id])]) {
 		pi.registerVirtualModel<RouterState>({

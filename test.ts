@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { Api, ClassifierApi, ClassifierContext, ClassifierModel, ClassifierResult, Model } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
-import extension, { type RectorConfig, type RouterState, type TimeSpec, type Usage, localParts, parseDays, parseReset, recordResponse, resolveConfig, routeRequest, timeMatches, validateConfig } from "./auto-router.ts";
+import extension, { type Criterion, type RectorConfig, type RouterState, type TimeSpec, type Usage, localParts, parseDays, parseReset, recordResponse, resolveConfig, routeRequest, timeMatches, validateConfig } from "./auto-router.ts";
 
 function check(label: string, got: unknown, want: unknown): void {
 	test(label, () => assert.deepStrictEqual(got, want));
@@ -47,42 +47,52 @@ check("no reset message", parseReset(undefined, NOW), null);
 check("empty reset message", parseReset("", NOW), null);
 
 function config(): RectorConfig { return resolveConfig().config; }
-test("default groups and effort overrides", () => {
+function peak(c: RectorConfig): Extract<Criterion, { type: "time" }> {
+	return c.criteria.zaiPeak as Extract<Criterion, { type: "time" }>;
+}
+test("default groups are ordered with the unconditional fallback last", () => {
 	const c = config();
-	assert.deepEqual(Object.keys(c.models), ["simple", "standard", "complex"]);
+	assert.deepEqual(Object.keys(c.models), ["simple", "complex", "standard"]);
+	assert.deepEqual(c.models.simple.criteria, ["simpleTask"]);
+	assert.deepEqual(c.models.complex.criteria, ["complexTask"]);
+	assert.equal(c.models.standard.criteria, undefined);
 	assert.equal((c.models.simple.candidates[1] as { level: string }).level, "high");
 	assert.equal((c.models.complex.candidates[0] as { level: string }).level, "medium");
+	assert.equal("classifier" in c, false);
 	validateConfig(c);
 });
 for (const [label, mutate, error] of [
 	["unknown criterion", (c) => { c.models.simple.criteria = ["missing"]; }, /defined criterion/],
-	["bad physical id", (c) => { c.models.simple.candidates = ["no-slash"]; }, /provider\/model/],
-	["empty model id", (c) => { c.models.simple.candidates = ["openai/"]; }, /provider\/model/],
+	["bad physical id", (c) => { c.models.simple.candidates = ["no-slash"]; }, /expected provider/],
+	["empty model id", (c) => { c.models.simple.candidates = ["openai/"]; }, /expected provider/],
 	["recursive Rector candidate", (c) => { c.models.simple.candidates = ["rector/auto"]; }, /physical models/],
 	["legacy recursive candidate", (c) => { c.models.simple.candidates = ["auto/smart"]; }, /physical models/],
 	["reserved group", (c) => { c.models.auto = c.models.simple; }, /reserved/],
+	["numeric group would break declared ordering", (c) => { c.models["12"] = c.models.simple; }, /invalid/],
 	["invalid group id", (c) => { c.models["has/slash"] = c.models.simple; }, /invalid/],
-	["missing fallback", (c) => { c.classifier.fallback = "missing"; }, /fallback/],
-	["unknown classifier group", (c) => { c.classifier.models.missing = "Pick this"; }, /unknown model group/],
-	["empty classifier rules", (c) => { c.classifier.models = {}; }, /must not be empty/],
-	["blank rule", (c) => { c.classifier.models.simple = " "; }, /non-empty string/],
-	["invalid criterion mode", (c) => { (c.criteria.zaiPeak as unknown as { mode: string }).mode = "maybe"; }, /invalid mode/],
-	["invalid days", (c) => { c.criteria.zaiPeak.time.days = ["lun"]; }, /Unknown day/],
-	["invalid time independent of weekday", (c) => { c.criteria.zaiPeak.time.days = []; c.criteria.zaiPeak.time.from = "12:99"; }, /Bad time/],
-	["invalid end of day", (c) => { c.criteria.zaiPeak.time.to = "24:01"; }, /Bad time/],
-	["invalid offset", (c) => { c.criteria.zaiPeak.time.tz = "UTC+25"; }, /Bad timezone/],
-	["invalid IANA zone", (c) => { c.criteria.zaiPeak.time.tz = "Not/AZone"; }, /time zone/i],
+	["unknown criterion type", (c) => { c.criteria.bad = { type: "script" } as never; }, /type must be/],
+	["classifier model missing", (c) => { c.criteria.bad = { type: "classifier", instructions: "Question" } as never; }, /non-empty string/],
+	["classifier question blank", (c) => { c.criteria.bad = { type: "classifier", model: "p/m", instructions: " " }; }, /non-empty string/],
+	["invalid criterion mode", (c) => { (peak(c) as unknown as { mode: string }).mode = "maybe"; }, /invalid mode/],
+	["invalid days", (c) => { peak(c).time.days = ["lun"]; }, /Unknown day/],
+	["invalid time independent of weekday", (c) => { peak(c).time.days = []; peak(c).time.from = "12:99"; }, /Bad time/],
+	["invalid end of day", (c) => { peak(c).time.to = "24:01"; }, /Bad time/],
+	["invalid offset", (c) => { peak(c).time.tz = "UTC+25"; }, /Bad timezone/],
+	["invalid IANA zone", (c) => { peak(c).time.tz = "Not/AZone"; }, /time zone/i],
 	["empty candidates", (c) => { c.models.simple.candidates = []; }, /non-empty array/],
+	["no model groups", (c) => { c.models = {}; }, /must not be empty/],
 	["unknown group property", (c) => { Object.assign(c.models.simple, { workload: "standard" }); }, /Unknown/],
 	["invalid level", (c) => { c.models.simple.candidates = [{ model: "openai/x", level: "super" } as never]; }, /invalid level/],
 	["null candidate", (c) => { c.models.simple.candidates = [null as never]; }, /must be an object/],
 ] satisfies [string, (c: RectorConfig) => void, RegExp][]) test(`validation: ${label}`, () => {
 	const c = config(); mutate(c); assert.throws(() => validateConfig(c), error);
 });
-test("settings scopes merge entries; classifier rules replace; null removes groups", () => {
-	const { config: c } = resolveConfig({ rector: { classifier: { models: { custom: "Custom work" }, fallback: "custom" }, models: { custom: { candidates: ["p/a"] }, simple: null } } }, { rector: { classifier: { instructions: "Project rules" }, models: { custom: { name: "Project", candidates: ["p/b"] } } } });
-	assert.deepEqual(c.classifier.models, { custom: "Custom work" });
-	assert.equal(c.classifier.instructions, "Project rules");
+test("scope overrides take priority in declared order; definitions replace and null removes", () => {
+	const { config: c } = resolveConfig(
+		{ rector: { models: { custom: { candidates: ["p/a"] }, simple: null } } },
+		{ rector: { models: { other: { candidates: ["p/c"] }, custom: { name: "Project", candidates: ["p/b"] } } } },
+	);
+	assert.deepEqual(Object.keys(c.models), ["other", "custom", "complex", "standard"]);
 	assert.deepEqual(c.models.custom.candidates, ["p/b"]);
 	assert.equal(c.models.simple, undefined);
 	assert(c.models.standard);
@@ -90,20 +100,44 @@ test("settings scopes merge entries; classifier rules replace; null removes grou
 test("bad settings types fail rather than silently default", () => {
 	for (const rector of [null, [], "bad", { classifier: null }, { models: [] }, { workloads: {} }]) assert.throws(() => resolveConfig({ rector }));
 });
-test("legacy conversion retains workloads, levels, criteria and filters both accounts", () => {
+test("legacy workloads convert to boolean group gates and filtered candidates", () => {
 	const input = { autoRouter: { workloads: { standard: ["openai/x", "openai-codex/x"] }, models: { codex: { workload: "standard", providers: ["openai-codex"] } } } };
 	const original = structuredClone(input);
 	const { config: c, legacy } = resolveConfig(input);
 	assert(legacy);
 	assert.deepEqual(c.models.codex.candidates, ["openai-codex/x"]);
-	assert(c.classifier.models.trivial);
+	assert.deepEqual(c.models.trivial.criteria, ["select-trivial"]);
+	assert.equal(c.criteria["select-trivial"].type, "classifier");
 	assert.deepEqual(input, original);
 });
-test("rector takes precedence over legacy, without mixing sections", () => {
+test("former rector classifier converts choices to gates, preserving time conditions and fallback order", () => {
+	const input = { rector: {
+		classifier: { model: "other/judge", instructions: "Choose carefully", models: { deep: "Hard work", basic: "Other work" }, fallback: "basic" },
+		criteria: { night: { mode: "include", time: { from: "23:00", to: "07:00" } } },
+		models: { basic: { candidates: ["p/a"] }, deep: { criteria: ["night"], candidates: ["p/b"] } },
+	} };
+	const before = structuredClone(input);
+	const { config: c, legacy } = resolveConfig(input);
+	assert(legacy); assert.deepEqual(input, before);
+	assert.deepEqual(Object.keys(c.models).slice(0, 2), ["deep", "basic"]);
+	assert.deepEqual(c.models.deep.criteria, ["night", "select-deep"]);
+	assert.equal(c.criteria.night.type, "time");
+	assert.equal((c.criteria["select-deep"] as { model: string }).model, "other/judge");
+	assert.match((c.criteria["select-deep"] as { instructions: string }).instructions, /Hard work/);
+	assert.equal("classifier" in c, false);
+});
+test("untyped time criteria remain readable with a migration warning", () => {
+	const { config: c, legacy } = resolveConfig({ rector: { criteria: { night: { mode: "include", time: {} } } } });
+	assert(legacy); assert.equal(c.criteria.night.type, "time");
+});
+test("rector takes precedence over autoRouter without mixing sections", () => {
 	const { config: c, legacy } = resolveConfig({ autoRouter: { workloads: { standard: ["p/old"] } } }, { rector: { models: { standard: { candidates: ["p/new"] } } } });
 	assert(legacy); assert.deepEqual(c.models.standard.candidates, ["p/new"]);
 });
-test("legacy undefined workloads fail explicitly", () => assert.throws(() => resolveConfig({ autoRouter: { models: { invalid: { workload: "missing" } } } }), /unknown workload/));
+test("legacy unknown workloads and selector references fail explicitly", () => {
+	assert.throws(() => resolveConfig({ autoRouter: { models: { invalid: { workload: "missing" } } } }), /unknown workload/);
+	assert.throws(() => resolveConfig({ rector: { classifier: { models: { absent: "Never" }, fallback: "absent" } } }), /unknown model group/);
+});
 
 function fixture() {
 	const c = config();
@@ -117,91 +151,170 @@ function fixture() {
 	const noAuth = new Set<string>();
 	const classifier = { provider: "opencode", id: "jev-1.13-free" } as ClassifierModel<ClassifierApi>;
 	let answer = "standard", failure = false, missing = false;
+	const probabilities: Record<string, number> = {};
 	let calls = 0;
-	let lastContext: ClassifierContext | undefined;
+	const contexts: ClassifierContext[] = [];
 	let lookup: unknown[] = [];
 	const registry: Parameters<typeof routeRequest>[3] = {
 		find: (provider, id) => catalog.get(`${provider}/${id}`),
 		hasConfiguredAuth: (model) => !noAuth.has(model.provider),
-		findOfType: ((_type: string, provider: string, id: string) => { lookup = [_type, provider, id]; return missing ? undefined : classifier; }) as Parameters<typeof routeRequest>[3]["findOfType"],
+		findOfType: ((_type: string, provider: string, id: string) => { lookup = [_type, provider, id]; return missing ? undefined : { ...classifier, provider, id }; }) as Parameters<typeof routeRequest>[3]["findOfType"],
 		classify: async (_model, context) => {
-			calls++; lastContext = context;
+			calls++; contexts.push(context);
 			if (failure) throw new Error("classifier offline");
-			return { api: "typesafe-system-one", provider: "opencode", model: classifier.id, timestamp: NOW, stopReason: "stop", answers: { model: { type: "choice", choice: answer, probabilities: { [answer]: 1 }, confidence: 1 } } };
+			return {
+				api: "typesafe-system-one", provider: _model.provider, model: _model.id, timestamp: NOW, stopReason: "stop",
+				answers: Object.fromEntries(Object.entries(context.questions).map(([id, question]) => {
+					const name = Object.keys(c.criteria).find((name) => {
+						const criterion = c.criteria[name];
+						return criterion.type === "classifier" && criterion.instructions === question.instructions;
+					})!;
+					const probability = probabilities[name] ?? Number(name === "simpleTask" && answer === "simple" || name === "complexTask" && answer === "complex");
+					return [id, { type: "bool" as const, probability }];
+				})),
+			};
 		},
 	};
 	const request = (overrides: Partial<ModelRouteRequest<RouterState>> = {}): ModelRouteRequest<RouterState> => ({ reason: "user", thinkingLevel: "medium", messages: [{ role: "user", content: "Fix this bug", timestamp: NOW }], ...overrides }) as ModelRouteRequest<RouterState>;
 	const route = (group: string | undefined = undefined, overrides: Partial<ModelRouteRequest<RouterState>> = {}) => routeRequest(c, group, request(overrides), registry, usage, new Date(NOW));
-	return { c, usage, catalog, noAuth, registry, request, route, setAnswer: (value: string) => { answer = value; }, setFailure: () => { failure = true; }, setMissing: () => { missing = true; }, get calls() { return calls; }, get context() { return lastContext; }, get lookup() { return lookup; } };
+	return {
+		c, usage, catalog, noAuth, registry, request, route,
+		setAnswer: (value: string) => { answer = value; },
+		setMatch: (name: string, value: boolean | number) => { probabilities[name] = typeof value === "boolean" ? Number(value) : value; },
+		setFailure: () => { failure = true; }, setMissing: () => { missing = true; },
+		get calls() { return calls; }, get context() { return contexts.at(-1); }, contexts, get lookup() { return lookup; },
+	};
 }
 function failed(model: Model<Api>, errorMessage = "retry after 60 seconds"): NonNullable<ModelRouteRequest<RouterState>["failed"]> {
 	return { model, thinkingLevel: "medium", message: { errorMessage, stopReason: "error" } } as NonNullable<ModelRouteRequest<RouterState>["failed"]>;
 }
-test("automatic routing uses configured classifier model and rules", async () => {
+function never(f: ReturnType<typeof fixture>): void {
+	f.c.criteria.never = { type: "time", mode: "include", time: { days: [] } };
+}
+test("automatic routing uses compatible classifier models and batches boolean rules", async () => {
 	const f = fixture();
-	f.c.classifier.model = "openrouter/typesafe/jev-1.14";
-	f.c.classifier.instructions = "Use these rules";
-	f.c.classifier.models = { standard: "Use for bug fixes" };
+	f.c.criteria.simpleTask = { type: "classifier", model: "openrouter/typesafe/jev-1.14", instructions: "Is this simple?" };
+	f.c.criteria.complexTask = { type: "classifier", model: "openrouter/typesafe/jev-1.14", instructions: "Is this complex?" };
+	f.setMatch("complexTask", true);
 	const result = await f.route();
-	assert.equal(result.model.id, "glm-5.3");
+	assert.equal(result.model.id, "gpt-6.1-sol");
 	assert.deepEqual(f.lookup, ["classifier", "openrouter", "typesafe/jev-1.14"]);
-	assert.deepEqual(f.context?.questions.model, { type: "choice", instructions: "Use these rules", criteria: { standard: "Use for bug fixes" } });
+	assert.equal(f.calls, 1);
+	assert.deepEqual(Object.values(f.context!.questions).map((q) => [q.type, q.instructions]), [["bool", "Is this simple?"], ["bool", "Is this complex?"]]);
 	assert.deepEqual(f.context?.state, { prompt: "Fix this bug" });
 });
-test("manual groups bypass classifier", async () => {
+test("manual group selection bypasses root classifiers", async () => {
 	const f = fixture(); f.setFailure();
 	const result = await f.route("complex");
 	assert.equal(result.model.id, "gpt-6.1-sol"); assert.equal(result.thinkingLevel, "medium"); assert.equal(f.calls, 0);
 });
-test("thinking never selects the group", async () => {
-	const f = fixture(); f.setAnswer("standard");
+test("manual selection keeps group-level time constraints", async () => {
+	const f = fixture(); never(f);
+	f.c.models.complex.criteria = ["complexTask", "never"];
+	await assert.rejects(f.route("complex"), /excluded by group time criteria/);
+	assert.equal(f.calls, 0);
+});
+test("manual selection does not bypass classifiers attached to candidates", async () => {
+	const f = fixture();
+	f.c.models.complex.candidates = [{ model: "openai/gpt-6.1-sol", criteria: ["complexTask"] }];
+	await assert.rejects(f.route("complex"), /candidate criteria not satisfied/);
+	assert.equal(f.calls, 1);
+});
+test("group and candidate criteria combine with AND", async () => {
+	const f = fixture(); never(f); f.setAnswer("simple");
+	f.c.models.simple.candidates = [{ model: "zai/glm-5.3-flash", criteria: ["never"] }, "openai/gpt-6-luna"];
+	const result = await f.route();
+	assert.equal(result.state?.group, "simple"); assert.equal(result.model.provider, "openai");
+});
+test("thinking never chooses the group", async () => {
+	const f = fixture();
 	for (const thinkingLevel of ["low", "medium", "high", "xhigh"] as const) {
 		const result = await f.route(undefined, { thinkingLevel });
 		assert.equal(result.state?.group, "standard"); assert.equal(result.thinkingLevel, thinkingLevel);
 	}
 	assert.equal(f.calls, 4);
 });
-test("arbitrary group names work in auto and manual modes", async () => {
+test("arbitrary group names work in automatic and manual modes", async () => {
 	const f = fixture();
-	f.c.models.lookup = f.c.models.simple;
-	f.c.classifier.models = { lookup: "Small lookups" }; f.c.classifier.fallback = "lookup";
-	f.setAnswer("lookup");
+	f.c.models = { lookup: f.c.models.simple, fallback: f.c.models.standard };
+	f.setAnswer("simple");
 	assert.equal((await f.route()).state?.group, "lookup");
 	assert.equal((await f.route("lookup")).state?.group, "lookup");
 });
-for (const mode of ["missing", "throws", "invalid"] as const) test(`classifier fallback: ${mode}`, async () => {
-	const f = fixture();
-	if (mode === "missing") f.setMissing(); else if (mode === "throws") f.setFailure(); else f.setAnswer("not-configured");
-	assert.equal((await f.route()).state?.group, "standard");
+test("first matching usable group wins when several classifiers return true", async () => {
+	const f = fixture(); f.setMatch("simpleTask", true); f.setMatch("complexTask", true);
+	assert.equal((await f.route()).state?.group, "simple");
+	f.c.models = { complex: f.c.models.complex, simple: f.c.models.simple, standard: f.c.models.standard };
+	assert.equal((await f.route()).state?.group, "complex");
 });
-test("classifier error result uses fallback", async () => {
-	const f = fixture(); f.registry.classify = async () => ({ stopReason: "error", answers: {} }) as ClassifierResult;
-	assert.equal((await f.route()).state?.group, "standard");
-});
-test("classifier choice with no answer uses fallback", async () => {
-	const f = fixture(); f.registry.classify = async () => ({ stopReason: "stop", answers: {} }) as ClassifierResult;
-	assert.equal((await f.route()).state?.group, "standard");
-});
-test("selected group unavailable does not downgrade", async () => {
+test("automatic selection can advance to another group if a matching group has no candidates", async () => {
 	const f = fixture(); f.setAnswer("complex"); f.usage.blocked = { openai: NOW + 60_000, "openai-codex": NOW + 60_000 };
-	await assert.rejects(f.route(), /rector\/complex: no candidate available/);
-	assert.equal(f.calls, 1);
+	assert.equal((await f.route()).state?.group, "standard");
+	await assert.rejects(f.route("complex"), /complex: no candidate available/);
 });
-test("criteria remove groups from classifier choices and block manual selection", async () => {
-	const f = fixture(); f.c.criteria.never = { mode: "include", time: { days: [] } }; f.c.models.complex.criteria = ["never"];
+for (const mode of ["missing", "throws", "false"] as const) test(`classifier gates fail closed: ${mode}`, async () => {
+	const f = fixture();
+	if (mode === "missing") f.setMissing(); else if (mode === "throws") f.setFailure();
+	assert.equal((await f.route()).state?.group, "standard");
+	assert.equal(f.calls, mode === "missing" ? 0 : 1);
+});
+for (const stopReason of ["error", "stop"] as const) test(`missing classifier answers close gates: ${stopReason}`, async () => {
+	const f = fixture(); f.registry.classify = async () => ({ stopReason, answers: {} }) as ClassifierResult;
+	assert.equal((await f.route()).state?.group, "standard");
+});
+for (const probability of [NaN, Infinity, -0.1, 1.1, 0.49]) test(`invalid or negative classifier verdict does not match: ${probability}`, async () => {
+	const f = fixture(); f.setMatch("simpleTask", probability);
+	assert.equal((await f.route()).state?.group, "standard");
+});
+test("boolean probability threshold is inclusive at 0.5", async () => {
+	const f = fixture(); f.setMatch("simpleTask", 0.5);
+	assert.equal((await f.route()).state?.group, "simple");
+});
+test("no matching group fails explicitly without inventing a fallback", async () => {
+	const f = fixture(); delete f.c.models.standard;
+	await assert.rejects(f.route(), /no eligible model group/);
+});
+test("time criteria are checked before classifiers even when listed last", async () => {
+	const f = fixture(); never(f);
+	for (const spec of Object.values(f.c.models)) spec.criteria = ["simpleTask", "never"];
+	await assert.rejects(f.route(), /no eligible model group/); assert.equal(f.calls, 0);
+});
+test("all unavailable physical candidates avoid classifier requests", async () => {
+	const f = fixture(); for (const provider of ["openai", "openai-codex", "zai"]) f.noAuth.add(provider);
+	await assert.rejects(f.route(), /no credentials/); assert.equal(f.calls, 0);
+});
+test("time-only routing works without a classifier", async () => {
+	const f = fixture(); f.c.models = { first: { candidates: ["zai/glm-5.3"] } };
+	assert.equal((await f.route()).state?.group, "first"); assert.equal(f.calls, 0);
+});
+test("unused classifier definitions are not sent to a provider", async () => {
+	const f = fixture(); f.c.criteria.unused = { type: "classifier", model: "opencode/jev-1.13-free", instructions: "Unused instruction" };
 	await f.route();
-	assert(!Object.hasOwn((f.context!.questions.model as { criteria: object }).criteria, "complex"));
-	await assert.rejects(f.route("complex"), /excluded by its criteria/);
+	assert(Object.values(f.context!.questions).every((q) => q.instructions !== "Unused instruction"));
 });
-test("unavailable fallback is an error, not a silent alternative group", async () => {
-	const f = fixture(); f.setMissing(); f.c.criteria.never = { mode: "include", time: { days: [] } }; f.c.models.standard.criteria = ["never"];
-	await assert.rejects(f.route(), /fallback group.*excluded/);
+test("classifiers with different model IDs are not batched together", async () => {
+	const f = fixture(); f.c.criteria.complexTask = { type: "classifier", model: "other/judge", instructions: "Complex?" };
+	await f.route(); assert.equal(f.calls, 2);
 });
-test("no eligible groups avoids the classifier call", async () => {
-	const f = fixture(); f.c.criteria.never = { mode: "include", time: { days: [] } };
-	for (const model of Object.values(f.c.models)) model.criteria = ["never"];
-	await assert.rejects(f.route(), /no model group is eligible/); assert.equal(f.calls, 0);
+test("multiple root and candidate gates share one classifier call", async () => {
+	const f = fixture(); f.setAnswer("simple");
+	f.c.models.simple.criteria = ["simpleTask", "complexTask"]; f.setMatch("complexTask", true);
+	f.c.models.simple.candidates = [{ model: "openai/gpt-6-luna", criteria: ["simpleTask"] }];
+	assert.equal((await f.route()).state?.group, "simple"); assert.equal(f.calls, 1);
 });
+test("new user turns discard cached classifier answers", async () => {
+	const f = fixture(); f.setAnswer("simple"); const first = await f.route();
+	f.setAnswer("complex"); const next = await f.route(undefined, { state: first.state });
+	assert.equal(next.state?.group, "complex"); assert.equal(f.calls, 2);
+});
+test("criteria edits invalidate persisted classifier answers", async () => {
+	const f = fixture(); f.setAnswer("complex"); const first = await f.route();
+	f.c.criteria.complexTask = { type: "classifier", model: "opencode/jev-1.13-free", instructions: "New rule" };
+	f.setAnswer("standard");
+	await assert.rejects(f.route(undefined, { reason: "continuation", state: first.state, previous: { model: first.model, thinkingLevel: first.thinkingLevel } }), /group criteria/);
+	assert.equal(f.calls, 2);
+});
+
 test("peak window skips GLM; Terra does not downgrade to Luna", async () => {
 	const f = fixture();
 	const result = await routeRequest(f.c, "standard", f.request(), f.registry, f.usage, new Date("2026-10-19T07:00:00Z"));
@@ -228,7 +341,7 @@ test("OpenAI pairs choose fewer dispatches and retain session affinity", async (
 	assert.equal(selected.model.provider, "openai"); assert.equal(f.usage.counts.openai, 21);
 });
 test("both pair members obey criteria and entry thinking", async () => {
-	const f = fixture(); f.c.criteria.never = { mode: "include", time: { days: [] } };
+	const f = fixture(); never(f);
 	f.c.models.complex.candidates = [{ model: "openai/gpt-6.1-sol", level: "low" }, { model: "openai-codex/gpt-6.1-sol", criteria: ["never"], level: "high" }];
 	f.usage.counts = { openai: 10, "openai-codex": 0 };
 	const result = await f.route("complex");
@@ -236,7 +349,10 @@ test("both pair members obey criteria and entry thinking", async () => {
 });
 test("manual and automatic selection resolve the same group identically", async () => {
 	const a = fixture(), b = fixture(); a.setAnswer("complex");
-	assert.deepEqual(await a.route(), await b.route("complex"));
+	const automatic = await a.route(), manual = await b.route("complex");
+	assert.deepEqual(automatic.model, manual.model);
+	assert.equal(automatic.thinkingLevel, manual.thinkingLevel);
+	assert.equal(automatic.state?.group, manual.state?.group);
 });
 for (const group of [undefined, "complex"] as const) test(`retry shares resolver: ${group ?? "automatic"}`, async () => {
 	const f = fixture(); f.setAnswer("complex");
@@ -247,10 +363,16 @@ for (const group of [undefined, "complex"] as const) test(`retry shares resolver
 	assert.equal(f.calls, group ? 0 : 1);
 });
 test("retry cannot bypass the other account's criterion", async () => {
-	const f = fixture(); f.c.criteria.never = { mode: "include", time: { days: [] } };
+	const f = fixture(); never(f);
 	f.c.models.complex.candidates[1] = { model: "openai-codex/gpt-6.1-sol", criteria: ["never"] };
 	const first = await f.route("complex");
 	await assert.rejects(f.route("complex", { reason: "retry", state: first.state, failed: failed(first.model) }), /no candidate available/);
+});
+test("automatic retry stays in its selected group even if another group is usable", async () => {
+	const f = fixture(); f.setAnswer("complex");
+	const first = await f.route(); f.usage.blocked["openai-codex"] = NOW + 60_000;
+	await assert.rejects(f.route(undefined, { reason: "retry", state: first.state, failed: failed(first.model) }), /complex: no candidate available/);
+	assert.equal(f.calls, 1);
 });
 test("retry follows candidate order even across providers", async () => {
 	const f = fixture(); const first = await f.route("standard");
@@ -275,13 +397,27 @@ test("continuation rechecks criteria, availability, and credential changes", asy
 	const result = await f.route("standard", { reason: "continuation", state: first.state, previous: { model: first.model, thinkingLevel: first.thinkingLevel } });
 	assert.equal(result.model.id, "gpt-6.1-terra");
 });
+test("continuations recheck time gates without repeating classifier calls", async () => {
+	const f = fixture(); f.setAnswer("simple"); const first = await f.route();
+	const result = await routeRequest(f.c, undefined, f.request({ reason: "continuation", state: first.state, previous: { model: first.model, thinkingLevel: first.thinkingLevel } }), f.registry, f.usage, new Date("2026-10-21T07:00:00Z"));
+	assert.equal(first.model.provider, "zai"); assert.equal(result.model.id, "gpt-6-luna"); assert.equal(f.calls, 1);
+});
+test("an expired group time gate stops a continuation rather than switching groups", async () => {
+	const f = fixture(); f.setAnswer("simple");
+	f.c.criteria.morning = { type: "time", mode: "include", time: { from: "10:00", to: "11:00", tz: "UTC" } };
+	f.c.models.simple.criteria = ["simpleTask", "morning"];
+	const first = await f.route();
+	await assert.rejects(routeRequest(f.c, undefined, f.request({ reason: "continuation", state: first.state, previous: { model: first.model, thinkingLevel: first.thinkingLevel } }), f.registry, f.usage, new Date("2026-10-20T12:00:00Z")), /excluded by group time criteria/);
+	assert.equal(f.calls, 1);
+});
 test("historical successful response cannot clear a current provider block", async () => {
 	const f = fixture(); f.usage.blocked.openai = NOW + 60_000;
 	const result = await f.route("complex", { previous: { model: f.catalog.get("openai/gpt-6.1-sol")!, thinkingLevel: "medium" } });
 	assert.equal(result.model.provider, "openai-codex"); assert.equal(f.usage.blocked.openai, NOW + 60_000);
 });
-test("direct requests use fallback without classifier", async () => {
-	const f = fixture(); assert.equal((await f.route(undefined, { reason: "direct" })).state?.group, "standard"); assert.equal(f.calls, 0);
+test("direct automatic requests follow the same ordered criteria", async () => {
+	const f = fixture(); f.setAnswer("simple");
+	assert.equal((await f.route(undefined, { reason: "direct" })).state?.group, "simple"); assert.equal(f.calls, 1);
 });
 test("aborted requests do not dispatch or fallback", async () => {
 	const f = fixture(); const controller = new AbortController(); controller.abort();
@@ -335,7 +471,7 @@ test("Pi's real model runtime accepts both Rector routes and keeps physical mode
 		});
 		await runtime.refresh({ allowNetwork: false });
 		const registry = new ModelRegistry(runtime);
-		const { config: c } = resolveConfig({ rector: { classifier: { model: "missing/classifier", models: { standard: "Any request" } }, models: { standard: { candidates: ["rector-fixture/physical"] } } } });
+		const { config: c } = resolveConfig({ rector: { models: { standard: { candidates: ["rector-fixture/physical"] } } } });
 		for (const id of ["auto", "standard"]) runtime.registerVirtualModel({
 			provider: "rector", id, name: id === "auto" ? "Rector" : "Standard", thinkingLevels: ["medium", "high"],
 			route: (request) => routeRequest(c, id === "auto" ? undefined : id, request as ModelRouteRequest<RouterState>, registry, { counts: {}, blocked: {} }),
@@ -366,7 +502,7 @@ test("registration exposes Rector groups and rejects untrusted project routing",
 		const registrations: Definition[] = [];
 		const hooks: string[] = [];
 		extension({ registerVirtualModel: (definition: Definition) => { registrations.push(definition); }, on: (event: string) => { hooks.push(event); } } as unknown as ExtensionAPI);
-		assert.deepEqual(registrations.map(({ provider, id, name }) => [provider, id, name]), [["rector", "auto", "Rector"], ["rector", "simple", "Simple"], ["rector", "standard", "Standard"], ["rector", "complex", "Complex"], ["rector", "custom", "Project Custom"]]);
+		assert.deepEqual(registrations.map(({ provider, id, name }) => [provider, id, name]), [["rector", "auto", "Rector"], ["rector", "custom", "Project Custom"], ["rector", "simple", "Simple"], ["rector", "complex", "Complex"], ["rector", "standard", "Standard"]]);
 		assert.deepEqual(hooks, ["message_end"]);
 		await assert.rejects(registrations[0].route(fixture().request(), { isProjectTrusted: () => false } as ExtensionContext), /requires project trust/);
 		assert.throws(() => { writeFileSync(join(dir, "settings.json"), "{broken"); extension({} as ExtensionAPI); }, /Cannot read Rector settings/);
