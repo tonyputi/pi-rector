@@ -237,11 +237,11 @@ Automatic requests without turn state, including direct requests such as compact
 
 ### Blocks and local state
 
-Physical assistant errors observed while using Rector create provider-wide blocks. Reset parsing recognizes date-time stamps and durations such as `2 hours and 30 minutes`. Date-time stamps are clamped to one minute–seven days ahead; durations are capped at five hours. Unrecognized reset information uses 30 minutes. A bare clock time such as `15:30` is not a recognized timestamp.
+Physical assistant errors observed while using Rector create provider-wide blocks, except context-overflow errors recognized by Pi: those remain eligible for Pi's compact-and-retry recovery. Reset parsing recognizes date-time stamps and durations such as `2 hours and 30 minutes` or `1.253s`. Date-time stamps are clamped to one minute–seven days ahead; durations are capped at five hours. Unrecognized reset information uses 30 minutes. A bare clock time such as `15:30` is not a recognized timestamp.
 
 Only newly observed successful responses clear blocks; historical successful responses do not. Selecting a normal physical model does not update Rector state.
 
-`router-usage.json`, beside the extension, persists dispatch counts and block deadlines. It contains routing metadata rather than prompts or credentials. Counts are not token usage or remaining quota. Keep the installation writable for persistence; separate installations have separate state, and concurrent processes can overwrite one another's updates.
+`router-usage.json`, beside the extension, persists dispatch counts and block deadlines. It contains routing metadata rather than prompts or credentials. Counts are not token usage or remaining quota. Writes replace the file atomically; invalid files stop routing rather than silently erasing history. Keep the installation writable for persistence; separate installations have separate state, and concurrent processes can overwrite one another's updates. Atomic replacement does not coordinate concurrent writers.
 
 ## Current limitations
 
@@ -253,13 +253,14 @@ Only newly observed successful responses clear blocks; historical successful res
 
 ## Migration
 
-Older `autoRouter`, the former `rector.classifier` selector, and untyped time criteria are temporarily converted **in memory** with a warning. No settings files or saved selections are rewritten. If `rector` exists in either scope, `autoRouter` is ignored entirely.
+Only the current typed `rector.criteria` and ordered `rector.models` schema is accepted. There are no automatic conversions or compatibility layers. Obsolete settings fail clearly rather than silently changing routing policy. No settings files are rewritten.
 
-- Former classifier choices become boolean group gates containing the original instructions and category descriptions. The old fallback is placed after the other listed categories.
-- Legacy workloads become model groups; explicitly configured pools become additional groups with filtered candidate lists. Invalid references or empty lists fail validation.
-- Untyped time conditions acquire `type: "time"`.
-- **Compatibility is structural, not identical classification behavior:** exclusive categories become independent yes/no questions, and automatic routing now selects the first usable matching group. Review the generated intent and migrate explicitly rather than relying on identical decisions.
-- Replace the former top-level `classifier` section with named classifier criteria, and attach those criteria to the relevant groups. Keep a fallback group last if desired.
+Before updating or reloading an existing installation:
+
+- Replace `autoRouter`, workloads, and pools with `rector.models` groups and physical candidate lists.
+- Replace the former `rector.classifier` section with named boolean classifier criteria, attached to the relevant groups. Independent yes/no questions are not equivalent to exclusive categories; review their order and fallback intentionally.
+- Add `type: "time"` to calendar criteria and `type: "classifier"` to classifier criteria.
+- Usage files must contain both `counts` and `blocked` objects. Older flat counter files are unsupported: back up and explicitly convert or reset them before loading this version.
 
 The selection IDs remain `rector/auto` and `rector/<group>`. Old `auto/` IDs are not registered. For Rector as the startup selection, merge:
 
@@ -279,6 +280,7 @@ The selection IDs remain `rector/auto` and `rector/<group>`. Old `auto/` IDs are
 | Always uses the last fallback | Check classifier availability, credentials, questions, and returned probabilities. Failed classifier gates do not pass. |
 | `no eligible model group` | No group could serve the request. Review the listed criteria, credentials, catalog entries, and block deadlines. |
 | Manual selection fails | Group time gates and all candidate gates still apply. Selecting a group does not bypass them. |
+| `Cannot read Rector usage` | Back up the named file, then restore valid `counts`/`blocked` data or explicitly reset it. Corrupt and obsolete files are not overwritten automatically. |
 | A turn stops instead of switching groups | Continuations and retries stay in the selected group; cross-group fallback is only for a fresh automatic selection. |
 | One OpenAI account gets most dispatches | Session affinity wins over counts. Confirm both matching entries are adjacent, eligible, and authenticated as intended. |
 
