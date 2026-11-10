@@ -1,12 +1,13 @@
 /** Network-free checks: config validation, routing, retry behavior, and Pi registration. */
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import fs, { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { Api, ClassifierApi, ClassifierContext, ClassifierModel, ClassifierResult, Model } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, ClassifierApi, ClassifierContext, ClassifierModel, ClassifierResult, Model } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
-import extension, { type Criterion, type RectorConfig, type RouterState, type TimeSpec, type Usage, localParts, parseDays, parseReset, recordResponse, resolveConfig, routeRequest, timeMatches, validateConfig } from "./auto-router.ts";
+import extension, { type Criterion, type RectorConfig, type RouterState, type TimeSpec, type Usage, localParts, parseDays, parseReset, readUsage, writeUsage, recordResponse, resolveConfig, routeRequest, timeMatches, validateConfig } from "./auto-router.ts";
 
 function check(label: string, got: unknown, want: unknown): void {
 	test(label, () => assert.deepStrictEqual(got, want));
@@ -39,6 +40,9 @@ const NOW = Date.parse("2026-10-20T10:00:00Z");
 check("explicit reset timestamp", parseReset("Resets at 2026-10-24T09:00:00Z", NOW), NOW + 95 * 3_600_000);
 check("past reset clamped", parseReset("resets at 2020-01-01T00:00:00Z", NOW), NOW + 60_000);
 check("reset seconds", parseReset("retry after 90 seconds", NOW), NOW + 90_000);
+check("fractional compact reset", parseReset("Please try again in 1.253s", NOW), NOW + 1253);
+check("fractional word reset", parseReset("Retry after 0.5 seconds", NOW), NOW + 500);
+check("compound fractional reset", parseReset("retry in 1.5 minutes and 0.25 seconds", NOW), NOW + 90_250);
 check("compound reset duration", parseReset("resets in 2 hours and 30 minutes", NOW), NOW + 2.5 * 3_600_000);
 check("duration capped", parseReset("retry in 10 days", NOW), NOW + 5 * 3_600_000);
 check("timestamp capped", parseReset("reset 2030-01-01T00:00:00Z", NOW), NOW + 7 * 86_400_000);
@@ -46,7 +50,7 @@ check("hyphenated limit ignored", parseReset("You have hit your 5-hour usage lim
 check("no reset message", parseReset(undefined, NOW), null);
 check("empty reset message", parseReset("", NOW), null);
 
-function config(): RectorConfig { return resolveConfig().config; }
+function config(): RectorConfig { return resolveConfig(); }
 function peak(c: RectorConfig): Extract<Criterion, { type: "time" }> {
 	return c.criteria.zaiPeak as Extract<Criterion, { type: "time" }>;
 }
@@ -66,7 +70,6 @@ for (const [label, mutate, error] of [
 	["bad physical id", (c) => { c.models.simple.candidates = ["no-slash"]; }, /expected provider/],
 	["empty model id", (c) => { c.models.simple.candidates = ["openai/"]; }, /expected provider/],
 	["recursive Rector candidate", (c) => { c.models.simple.candidates = ["rector/auto"]; }, /physical models/],
-	["legacy recursive candidate", (c) => { c.models.simple.candidates = ["auto/smart"]; }, /physical models/],
 	["reserved group", (c) => { c.models.auto = c.models.simple; }, /reserved/],
 	["numeric group would break declared ordering", (c) => { c.models["12"] = c.models.simple; }, /invalid/],
 	["invalid group id", (c) => { c.models["has/slash"] = c.models.simple; }, /invalid/],
@@ -88,7 +91,7 @@ for (const [label, mutate, error] of [
 	const c = config(); mutate(c); assert.throws(() => validateConfig(c), error);
 });
 test("scope overrides take priority in declared order; definitions replace and null removes", () => {
-	const { config: c } = resolveConfig(
+	const c = resolveConfig(
 		{ rector: { models: { custom: { candidates: ["p/a"] }, simple: null } } },
 		{ rector: { models: { other: { candidates: ["p/c"] }, custom: { name: "Project", candidates: ["p/b"] } } } },
 	);
@@ -100,43 +103,74 @@ test("scope overrides take priority in declared order; definitions replace and n
 test("bad settings types fail rather than silently default", () => {
 	for (const rector of [null, [], "bad", { classifier: null }, { models: [] }, { workloads: {} }]) assert.throws(() => resolveConfig({ rector }));
 });
-test("legacy workloads convert to boolean group gates and filtered candidates", () => {
-	const input = { autoRouter: { workloads: { standard: ["openai/x", "openai-codex/x"] }, models: { codex: { workload: "standard", providers: ["openai-codex"] } } } };
-	const original = structuredClone(input);
-	const { config: c, legacy } = resolveConfig(input);
-	assert(legacy);
-	assert.deepEqual(c.models.codex.candidates, ["openai-codex/x"]);
-	assert.deepEqual(c.models.trivial.criteria, ["select-trivial"]);
-	assert.equal(c.criteria["select-trivial"].type, "classifier");
-	assert.deepEqual(input, original);
+test("obsolete settings are rejected, never converted or silently ignored", () => {
+	for (const settings of [
+		{ autoRouter: {} },
+		{ autoRouter: {}, rector: {} },
+		{ rector: { classifier: {} } },
+		{ rector: { criteria: { old: { mode: "include", time: {} } } } },
+	]) {
+		const before = structuredClone(settings);
+		assert.throws(() => resolveConfig(settings));
+		assert.throws(() => resolveConfig({}, settings));
+		assert.deepEqual(settings, before);
+	}
 });
-test("former rector classifier converts choices to gates, preserving time conditions and fallback order", () => {
-	const input = { rector: {
-		classifier: { model: "other/judge", instructions: "Choose carefully", models: { deep: "Hard work", basic: "Other work" }, fallback: "basic" },
-		criteria: { night: { mode: "include", time: { from: "23:00", to: "07:00" } } },
-		models: { basic: { candidates: ["p/a"] }, deep: { criteria: ["night"], candidates: ["p/b"] } },
-	} };
-	const before = structuredClone(input);
-	const { config: c, legacy } = resolveConfig(input);
-	assert(legacy); assert.deepEqual(input, before);
-	assert.deepEqual(Object.keys(c.models).slice(0, 2), ["deep", "basic"]);
-	assert.deepEqual(c.models.deep.criteria, ["night", "select-deep"]);
-	assert.equal(c.criteria.night.type, "time");
-	assert.equal((c.criteria["select-deep"] as { model: string }).model, "other/judge");
-	assert.match((c.criteria["select-deep"] as { instructions: string }).instructions, /Hard work/);
-	assert.equal("classifier" in c, false);
+test("usage round-trips, sanitizes numbers, and leaves no temporary files", () => {
+	const dir = mkdtempSync(join(tmpdir(), "rector-usage-")), path = join(dir, "usage.json");
+	try {
+		assert.deepEqual(readUsage(path), { counts: {}, blocked: {} });
+		writeUsage({ counts: { openai: 3 }, blocked: { zai: NOW + 1000 } }, path);
+		assert.deepEqual(readUsage(path), { counts: { openai: 3 }, blocked: { zai: NOW + 1000 } });
+		writeUsage({ counts: { openai: 4 }, blocked: {} }, path);
+		assert.deepEqual(readUsage(path), { counts: { openai: 4 }, blocked: {} });
+		writeFileSync(path, JSON.stringify({ counts: { good: 2, bad: -1, text: "3" }, blocked: {} }));
+		assert.deepEqual(readUsage(path), { counts: { good: 2 }, blocked: {} });
+		assert.deepEqual(readdirSync(dir), ["usage.json"]);
+	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
-test("untyped time criteria remain readable with a migration warning", () => {
-	const { config: c, legacy } = resolveConfig({ rector: { criteria: { night: { mode: "include", time: {} } } } });
-	assert(legacy); assert.equal(c.criteria.night.type, "time");
+test("invalid and obsolete usage files are rejected without being overwritten", () => {
+	const dir = mkdtempSync(join(tmpdir(), "rector-usage-")), path = join(dir, "usage.json");
+	try {
+		for (const content of ["{broken", "null", '{"openai":3}', '{"counts":{}}']) {
+			writeFileSync(path, content);
+			assert.throws(() => readUsage(path), /Cannot read Rector usage/);
+			assert.equal(readFileSync(path, "utf8"), content);
+		}
+	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
-test("rector takes precedence over autoRouter without mixing sections", () => {
-	const { config: c, legacy } = resolveConfig({ autoRouter: { workloads: { standard: ["p/old"] } } }, { rector: { models: { standard: { candidates: ["p/new"] } } } });
-	assert(legacy); assert.deepEqual(c.models.standard.candidates, ["p/new"]);
+test("a failed atomic replacement leaves the original complete and removes the temporary file", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "rector-usage-")), path = join(dir, "usage.json");
+	writeUsage({ counts: { openai: 2 }, blocked: {} }, path);
+	const before = readFileSync(path, "utf8");
+	let snapshot: { original: string; replacement: string } | undefined;
+	const rename = t.mock.method(fs, "renameSync", (from: fs.PathLike, to: fs.PathLike) => {
+		snapshot = { original: readFileSync(to, "utf8"), replacement: readFileSync(from, "utf8") };
+		throw new Error("Simulated replacement failure");
+	});
+	syncBuiltinESMExports();
+	try {
+		writeUsage({ counts: { openai: 3 }, blocked: {} }, path);
+		assert.deepEqual(snapshot, { original: before, replacement: JSON.stringify({ counts: { openai: 3 }, blocked: {} }) });
+		assert.equal(readFileSync(path, "utf8"), before);
+		assert.deepEqual(readdirSync(dir), ["usage.json"]);
+	} finally {
+		rename.mock.restore(); syncBuiltinESMExports(); rmSync(dir, { recursive: true, force: true });
+	}
 });
-test("legacy unknown workloads and selector references fail explicitly", () => {
-	assert.throws(() => resolveConfig({ autoRouter: { models: { invalid: { workload: "missing" } } } }), /unknown workload/);
-	assert.throws(() => resolveConfig({ rector: { classifier: { models: { absent: "Never" }, fallback: "absent" } } }), /unknown model group/);
+test("failed persistence preserves the destination and cleans temporary files", () => {
+	const dir = mkdtempSync(join(tmpdir(), "rector-usage-")), path = join(dir, "usage.json");
+	try {
+		writeUsage({ counts: { openai: 2 }, blocked: {} }, path);
+		const before = readFileSync(path, "utf8");
+		writeUsage({ counts: { invalid: 1n as never }, blocked: {} }, path);
+		assert.equal(readFileSync(path, "utf8"), before);
+		const directory = join(dir, "destination");
+		mkdirSync(directory); writeFileSync(join(directory, "keep"), "unchanged");
+		writeUsage({ counts: {}, blocked: {} }, directory);
+		assert.equal(readFileSync(join(directory, "keep"), "utf8"), "unchanged");
+		assert.deepEqual(readdirSync(dir).sort(), ["destination", "usage.json"]);
+	} finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 function fixture() {
@@ -185,8 +219,15 @@ function fixture() {
 		get calls() { return calls; }, get context() { return contexts.at(-1); }, contexts, get lookup() { return lookup; },
 	};
 }
+function response(message: Pick<AssistantMessage, "provider" | "stopReason"> & Partial<AssistantMessage>): AssistantMessage {
+	return {
+		role: "assistant", api: "openai-responses", model: "fixture", content: [], timestamp: NOW,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		...message,
+	};
+}
 function failed(model: Model<Api>, errorMessage = "retry after 60 seconds"): NonNullable<ModelRouteRequest<RouterState>["failed"]> {
-	return { model, thinkingLevel: "medium", message: { errorMessage, stopReason: "error" } } as NonNullable<ModelRouteRequest<RouterState>["failed"]>;
+	return { model, thinkingLevel: "medium", message: response({ provider: model.provider, model: model.id, errorMessage, stopReason: "error" }) };
 }
 function never(f: ReturnType<typeof fixture>): void {
 	f.c.criteria.never = { type: "time", mode: "include", time: { days: [] } };
@@ -437,17 +478,36 @@ test("classifier input uses only last user text, with a 16000-character limit", 
 	await f.route(undefined, { messages: [{ role: "user", content: "old", timestamp: NOW }, { role: "user", content: [{ type: "text", text: "x".repeat(16_500) }, { type: "image", data: "not-sent", mimeType: "image/png" }], timestamp: NOW }] });
 	assert.deepEqual(f.context?.state, { prompt: "x".repeat(16_000) });
 });
+test("context overflow neither creates nor clears provider blocks", () => {
+	const f = fixture();
+	const message = response({ provider: "zai", stopReason: "error", errorMessage: "maximum context length exceeded" });
+	recordResponse(f.usage, message, NOW);
+	assert.deepEqual(f.usage.blocked, {});
+	f.usage.blocked.zai = NOW + 60_000;
+	recordResponse(f.usage, message, NOW);
+	assert.equal(f.usage.blocked.zai, NOW + 60_000);
+});
+test("context overflow retry can reuse the provider after Pi compacts", async () => {
+	const f = fixture(); const first = await f.route("standard");
+	const next = await f.route("standard", { reason: "retry", state: first.state, failed: failed(first.model, "maximum context length exceeded") });
+	assert.equal(next.model.provider, "zai"); assert.deepEqual(f.usage.blocked, {});
+});
+test("rate limits still block even when their text mentions tokens", () => {
+	const f = fixture();
+	recordResponse(f.usage, response({ provider: "zai", stopReason: "error", errorMessage: "rate limit: too many tokens; retry in 2 seconds" }), NOW);
+	assert.equal(f.usage.blocked.zai, NOW + 2000);
+});
 test("an observed error blocks the next turn even without a Pi retry", async () => {
 	const f = fixture();
-	recordResponse(f.usage, { provider: "zai", stopReason: "error", errorMessage: "retry after 90 seconds" }, NOW);
+	recordResponse(f.usage, response({ provider: "zai", stopReason: "error", errorMessage: "retry after 90 seconds" }), NOW);
 	assert.equal((await f.route("standard")).model.provider, "openai");
 	assert.equal(f.usage.blocked.zai, NOW + 90_000);
 });
 test("only new successful responses clear blocks; cancellation does not", () => {
 	const f = fixture(); f.usage.blocked = { zai: NOW + 60_000 };
-	recordResponse(f.usage, { provider: "zai", stopReason: "aborted" }, NOW);
+	recordResponse(f.usage, response({ provider: "zai", stopReason: "aborted" }), NOW);
 	assert.equal(f.usage.blocked.zai, NOW + 60_000);
-	recordResponse(f.usage, { provider: "zai", stopReason: "stop" }, NOW);
+	recordResponse(f.usage, response({ provider: "zai", stopReason: "stop" }), NOW);
 	assert.equal(f.usage.blocked.zai, undefined);
 });
 test("README examples validate and the complete policy equals the defaults", () => {
@@ -471,7 +531,7 @@ test("Pi's real model runtime accepts both Rector routes and keeps physical mode
 		});
 		await runtime.refresh({ allowNetwork: false });
 		const registry = new ModelRegistry(runtime);
-		const { config: c } = resolveConfig({ rector: { models: { standard: { candidates: ["rector-fixture/physical"] } } } });
+		const c = resolveConfig({ rector: { models: { standard: { candidates: ["rector-fixture/physical"] } } } });
 		for (const id of ["auto", "standard"]) runtime.registerVirtualModel({
 			provider: "rector", id, name: id === "auto" ? "Rector" : "Standard", thinkingLevels: ["medium", "high"],
 			route: (request) => routeRequest(c, id === "auto" ? undefined : id, request as ModelRouteRequest<RouterState>, registry, { counts: {}, blocked: {} }),
