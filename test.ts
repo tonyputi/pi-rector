@@ -9,6 +9,16 @@ import type { Api, AssistantMessage, ClassifierApi, ClassifierContext, Classifie
 import { ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
 import extension, { type Criterion, type RectorConfig, type RouterState, type TimeSpec, type Usage, localParts, parseDays, parseReset, readUsage, writeUsage, recordResponse, resolveConfig, routeRequest, timeMatches, validateConfig } from "./auto-router.ts";
 
+test("release publishes npm and GitHub assets without protected-branch write-back", () => {
+	const { release } = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
+	assert.deepEqual(release.plugins, [
+		"@semantic-release/commit-analyzer",
+		"@semantic-release/release-notes-generator",
+		"@semantic-release/npm",
+		"@semantic-release/github",
+	]);
+});
+
 function check(label: string, got: unknown, want: unknown): void {
 	test(label, () => assert.deepStrictEqual(got, want));
 }
