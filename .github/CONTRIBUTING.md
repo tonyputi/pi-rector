@@ -22,6 +22,15 @@ No build step: the extension ships as `auto-router.ts` and Pi loads its TypeScri
 - Use [Conventional Commits](https://www.conventionalcommits.org/) in PR titles: `fix:` patches, `feat:` bumps minor, and breaking-change markers bump major. `docs:`, `chore:`, and `test:` do not trigger releases by themselves. Semantic-release uses the commits that land on the release branch.
 - Never commit credentials, private prompts, session histories, or local `router-usage.json` state.
 
+## Releases
+
+The Release workflow runs semantic-release after a merge to `main`. It publishes
+npm packages, versioned Git tags and GitHub Releases without pushing release commits
+to the protected branch. The npm plugin sets the published package version in the CI
+workspace; the source `package.json` keeps its development-version placeholder.
+Use [GitHub Releases](https://github.com/tonyputi/pi-rector/releases) for current
+release notes. The existing `CHANGELOG.md` is retained as historical release notes.
+
 ## Security issues
 
 **Do not open a public issue for security problems.** Use [private vulnerability reporting](https://github.com/tonyputi/pi-rector/security/advisories/new).
