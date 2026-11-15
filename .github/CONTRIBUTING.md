@@ -22,6 +22,25 @@ No build step: the extension ships as `auto-router.ts` and Pi loads its TypeScri
 - Use [Conventional Commits](https://www.conventionalcommits.org/) in PR titles: `fix:` patches, `feat:` bumps minor, and breaking-change markers bump major. `docs:`, `chore:`, and `test:` do not trigger releases by themselves. Semantic-release uses the commits that land on the release branch.
 - Never commit credentials, private prompts, session histories, or local `router-usage.json` state.
 
+## Dependabot auto-merge
+
+After the caller is merged to `main`, successful `CI` pull-request runs let the
+shared workflow opt current, non-draft Dependabot PRs to `main` into native squash
+auto-merge. All update types are eligible; titles are not rewritten. Required
+checks and human CODEOWNER approval still gate merging; no approval or bypass is
+provided by the workflow.
+
+Before merging the caller, verify that native auto-merge and squash are enabled,
+required checks and human CODEOWNER review are enforced with stale approvals
+dismissed, and the App has no bypass. The caller needs the Actions variable
+`GH_APP_ID` and secret `GH_APP_PRIVATE_KEY`, with the App installed on this repository
+and granted Contents and Pull requests write permissions. Repository settings are
+managed separately through Terraform.
+
+The caller does not run from an unmerged PR. Live acceptance needs a future actual
+Dependabot PR and human review. To opt out, remove the caller and cancel its active
+runs; disable auto-merge separately on already queued PRs.
+
 ## Releases
 
 The Release workflow runs semantic-release after a merge to `main`. It publishes
